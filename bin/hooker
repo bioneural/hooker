@@ -1,0 +1,386 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# hooker — declarative policy engine for Claude Code hooks
+# https://github.com/bioneural/hooker
+# MIT License — Copyright (c) 2026 Fort Asset LLC
+#
+# Reads hook event JSON from stdin, evaluates it against policies defined
+# in .claude/policies.yaml, and returns a decision on stdout.
+#
+# Three policy types:
+#
+#   gate      — blocks an action. Regex match on tool input. Deterministic.
+#               Zero cost. First matching gate wins.
+#
+#   transform — rewrites an action via a side-channel `claude -p` call.
+#               The transformation happens outside the main agent's context
+#               window — zero token pollution. All matching transforms are
+#               accumulated into one prompt, one model call.
+#
+#   inject    — surfaces context before the agent acts. All matching injects
+#               accumulate. Context files are read and concatenated.
+#
+# Any policy can include a `classifier` field to gate it behind a local
+# ollama model call. The classifier runs after regex matching and before
+# execution. Use this for intelligent filtering (e.g., "does this prompt
+# warrant panel review?").
+#
+# Execution priority: gates > transforms > injects
+# Fail-open: every error path allows the action.
+#
+# Policy schema (.claude/policies.yaml):
+#
+#   policies:
+#     - name: human-readable label
+#       event: PreToolUse | UserPromptSubmit     # hook event to match (Claude Code hook events)
+#       tool: Bash | Edit|Write | ...            # regex on tool name (PreToolUse only)
+#                                                # known tools: Bash, Edit, MultiEdit, Write, Read,
+#                                                # Glob, Grep, NotebookEdit, Task, WebFetch, WebSearch
+#       match: "pattern" | :constant              # regex on tool input content, or a
+#                                                # predefined constant (see MATCH_CONSTANTS).
+#                                                # constants: :git_commit, :git_push,
+#                                                # :git_push_force, :git_reset, :git_rebase,
+#                                                # :git_checkout, :git_merge, :git_stash
+#       match_field: command | file_path | ...   # which tool_input field to match against
+#       transform_field: content | command | ... # which tool_input field the transform rewrites
+#                                                # (defaults to match_field; use when match and
+#                                                # transform target different fields, e.g. match
+#                                                # on file_path but rewrite content)
+#       type: gate | transform | inject          # policy type
+#       message: "reason"                        # gate: denial message
+#       context:                                 # transform/inject: files to read
+#         - IDENTITY.md
+#       prompt: "instruction"                    # transform: what to do with the input
+#       model: haiku | sonnet                    # transform: model for claude -p
+#       classifier:                              # optional: local LLM gate
+#         model: gemma3:1b                       # ollama model
+#         prompt: "yes/no question"              # classification prompt
+#
+# Hook wiring (.claude/settings.json):
+#
+#   { "hooks": { "PreToolUse": [{ "matcher": "Bash|Edit|Write",
+#     "hooks": [{ "type": "command", "command": "bin/hooker" }] }] } }
+#
+# Dependencies: Ruby stdlib only (json, yaml, open3). No gems. No API keys.
+# Transforms use `claude -p`. Classifiers use `ollama run`.
+
+require 'json'
+require 'yaml'
+require 'open3'
+
+module Hooker
+  # Predefined match constants. Use `:name` in the match field to reference.
+  # These handle tool-generated command variations (e.g. `git -C /path commit`
+  # instead of `git commit`) so policy authors don't need to know the details.
+  #
+  # The GIT_PREFIX pattern matches `git` followed by zero or more global flags
+  # (tokens starting with - or /) before the subcommand. This prevents false
+  # positives from subcommand words appearing in commit messages or arguments.
+  GIT_PREFIX = 'git\b(\s+[-/]\S+)*\s+'
+
+  MATCH_CONSTANTS = {
+    ':git_commit'     => "#{GIT_PREFIX}commit\\b",
+    ':git_push'       => "#{GIT_PREFIX}push\\b",
+    ':git_push_force' => "#{GIT_PREFIX}push\\b.*--force",
+    ':git_reset'      => "#{GIT_PREFIX}reset\\b",
+    ':git_rebase'     => "#{GIT_PREFIX}rebase\\b",
+    ':git_checkout'   => "#{GIT_PREFIX}checkout\\b",
+    ':git_merge'      => "#{GIT_PREFIX}merge\\b",
+    ':git_stash'      => "#{GIT_PREFIX}stash\\b"
+  }.freeze
+
+  DEFAULT_MATCH_FIELDS = {
+    'Bash'         => 'command',
+    'Edit'         => 'file_path',
+    'MultiEdit'    => 'file_path',
+    'Write'        => 'file_path',
+    'Read'         => 'file_path',
+    'Glob'         => 'pattern',
+    'Grep'         => 'pattern',
+    'NotebookEdit' => 'notebook_path',
+    'Task'         => 'prompt',
+    'WebFetch'     => 'url',
+    'WebSearch'    => 'query'
+  }.freeze
+
+  module_function
+
+  # -- Parse --
+
+  def parse_event(raw)
+    JSON.parse(raw)
+  rescue JSON::ParserError => e
+    $stderr.puts "hooker: invalid JSON input: #{e.message}"
+    exit 0
+  end
+
+  def find_project_root(cwd)
+    dir = File.expand_path(cwd)
+    loop do
+      return dir if File.exist?(File.join(dir, '.claude', 'policies.yaml'))
+      parent = File.dirname(dir)
+      return nil if parent == dir
+      dir = parent
+    end
+  end
+
+  def load_policies(project_root)
+    return [] if project_root.nil?
+    path = File.join(project_root, '.claude', 'policies.yaml')
+    return [] unless File.exist?(path)
+    data = YAML.safe_load(File.read(path))
+    return [] unless data.is_a?(Hash) && data['policies'].is_a?(Array)
+    data['policies']
+  rescue => e
+    $stderr.puts "hooker: failed to load policies: #{e.message}"
+    []
+  end
+
+  # -- Match --
+
+  def resolve_match_value(event, policy)
+    if event['hook_event_name'] == 'UserPromptSubmit'
+      return event['prompt'] || ''
+    end
+    tool_input = event['tool_input'] || {}
+    field = policy['match_field'] || DEFAULT_MATCH_FIELDS[event['tool_name']] || 'command'
+    value = tool_input[field]
+    value = tool_input.to_json if value.nil?
+    value.is_a?(String) ? value : value.to_s
+  end
+
+  def resolve_match_pattern(raw)
+    return raw unless raw.is_a?(String) && raw.start_with?(':')
+    resolved = MATCH_CONSTANTS[raw]
+    if resolved.nil?
+      $stderr.puts "hooker: unknown match constant '#{raw}'"
+      return nil
+    end
+    resolved
+  end
+
+  def policy_matches?(policy, event)
+    if policy['event']
+      return false unless event['hook_event_name'] == policy['event']
+    end
+
+    if policy['tool']
+      tool_re = Regexp.new("\\A(?:#{policy['tool']})\\z")
+      return false unless tool_re.match?(event['tool_name'].to_s)
+    end
+
+    if policy['match']
+      pattern = resolve_match_pattern(policy['match'])
+      return false if pattern.nil?
+      value = resolve_match_value(event, policy)
+      return false unless Regexp.new(pattern).match?(value)
+    end
+
+    true
+  rescue RegexpError => e
+    $stderr.puts "hooker: invalid regex in policy '#{policy['name']}': #{e.message}"
+    false
+  end
+
+  def find_matching_policies(policies, event)
+    matched = policies.select { |p| policy_matches?(p, event) }
+    matched = matched.select { |p| classify?(p['classifier'], event) }
+    {
+      gates:      matched.select { |p| p['type'] == 'gate' },
+      transforms: matched.select { |p| p['type'] == 'transform' },
+      injects:    matched.select { |p| p['type'] == 'inject' }
+    }
+  end
+
+  # -- Support --
+
+  def read_context_files(paths, project_root)
+    parts = []
+    paths.each do |rel_path|
+      abs_path = File.join(project_root, rel_path)
+      unless File.exist?(abs_path)
+        $stderr.puts "hooker: context file not found: #{abs_path}"
+        next
+      end
+      filename = File.basename(rel_path)
+      parts << "<#{filename}>\n#{File.read(abs_path)}\n</#{filename}>"
+    end
+    parts.join("\n\n")
+  end
+
+  def build_transform_prompt(transforms, event, project_root)
+    all_context_paths = transforms.flat_map { |t| t['context'] || [] }.uniq
+    context = read_context_files(all_context_paths, project_root)
+
+    tool_input_json = JSON.pretty_generate(event['tool_input'] || {})
+
+    instructions = transforms.map.with_index do |t, i|
+      label = transforms.length > 1 ? "#{i + 1}. " : ''
+      "#{label}#{t['prompt']}"
+    end.join("\n")
+
+    parts = []
+    parts << "<context>\n#{context}\n</context>" unless context.empty?
+    parts << "<current_input>\n#{tool_input_json}\n</current_input>"
+    parts << "<instructions>\n#{instructions}\n</instructions>"
+    parts << 'Return ONLY the transformed value. No explanation, no markdown fencing.'
+    parts.join("\n\n")
+  end
+
+  def call_claude(prompt, model = nil)
+    cmd = ['claude', '-p']
+    cmd += ['--model', model] if model
+    stdout, status = Open3.capture2(*cmd, stdin_data: prompt)
+    unless status.success?
+      $stderr.puts "hooker: claude -p exited with #{status.exitstatus}"
+      return nil
+    end
+    result = stdout.strip
+    result = result.sub(/\A```\w*\n?/, '').sub(/\n?```\z/, '').strip
+    result
+  rescue Errno::ENOENT
+    $stderr.puts 'hooker: claude CLI not found'
+    nil
+  rescue => e
+    $stderr.puts "hooker: claude -p failed: #{e.message}"
+    nil
+  end
+
+  def call_ollama(prompt, model = 'gemma3:1b')
+    stdout, status = Open3.capture2('ollama', 'run', model, stdin_data: prompt)
+    unless status.success?
+      $stderr.puts "hooker: ollama exited with #{status.exitstatus}"
+      return nil
+    end
+    stdout.strip
+  rescue Errno::ENOENT
+    $stderr.puts 'hooker: ollama not found'
+    nil
+  rescue => e
+    $stderr.puts "hooker: ollama failed: #{e.message}"
+    nil
+  end
+
+  def classify?(classifier, event)
+    return true if classifier.nil?
+    model = classifier['model'] || 'gemma3:1b'
+    prompt = classifier['prompt'] || 'Does this warrant review? Answer only yes or no.'
+
+    input_text = event['prompt'] || event.dig('tool_input', 'command') || ''
+    full_prompt = "#{prompt}\n\nInput: #{input_text}"
+
+    result = call_ollama(full_prompt, model)
+    return false if result.nil?
+    result.downcase.start_with?('yes')
+  end
+
+  # -- Execute --
+
+  def execute_gate(policy, event)
+    reason = policy['message'] || "Blocked by policy: #{policy['name']}"
+    output_deny(event['hook_event_name'], reason)
+  end
+
+  def execute_transforms(transforms, event, project_root)
+    prompt = build_transform_prompt(transforms, event, project_root)
+
+    model = transforms.first['model']
+    response = call_claude(prompt, model)
+    return nil if response.nil? || response.empty?
+
+    field = transforms.first['transform_field'] ||
+            transforms.first['match_field'] ||
+            DEFAULT_MATCH_FIELDS[event['tool_name']] ||
+            'command'
+
+    updated = (event['tool_input'] || {}).dup
+    updated[field] = response
+    updated
+  end
+
+  def execute_injects(injects, project_root)
+    all_paths = injects.flat_map { |p| p['context'] || [] }.uniq
+    context = read_context_files(all_paths, project_root)
+    context.empty? ? nil : context
+  end
+
+  # -- Output --
+
+  def output_deny(event_name, reason)
+    puts JSON.generate({
+      hookSpecificOutput: {
+        hookEventName: event_name,
+        permissionDecision: 'deny',
+        permissionDecisionReason: reason
+      }
+    })
+  end
+
+  def output_updated_input(event_name, updated_input)
+    puts JSON.generate({
+      hookSpecificOutput: {
+        hookEventName: event_name,
+        updatedInput: updated_input
+      }
+    })
+  end
+
+  def output_additional_context(event_name, context_text)
+    puts JSON.generate({
+      hookSpecificOutput: {
+        hookEventName: event_name,
+        additionalContext: context_text
+      }
+    })
+  end
+
+  def output_allow
+    exit 0
+  end
+
+  # -- Entry --
+
+  def run
+    raw = $stdin.read
+    exit 0 if raw.nil? || raw.strip.empty?
+
+    event = parse_event(raw)
+    cwd = event['cwd'] || Dir.pwd
+    project_root = find_project_root(cwd)
+
+    policies = load_policies(project_root)
+    exit 0 if policies.empty?
+
+    matched = find_matching_policies(policies, event)
+    event_name = event['hook_event_name']
+
+    # Gates: first match denies
+    unless matched[:gates].empty?
+      execute_gate(matched[:gates].first, event)
+      exit 0
+    end
+
+    # Transforms: all matches accumulated, one claude -p call
+    unless matched[:transforms].empty?
+      updated = execute_transforms(matched[:transforms], event, project_root)
+      if updated
+        output_updated_input(event_name, updated)
+        exit 0
+      end
+    end
+
+    # Injects: all matches accumulated
+    unless matched[:injects].empty?
+      context = execute_injects(matched[:injects], project_root)
+      if context
+        output_additional_context(event_name, context)
+        exit 0
+      end
+    end
+
+    output_allow
+  end
+end
+
+Hooker.run
