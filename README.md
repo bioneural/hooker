@@ -200,16 +200,18 @@ Match constants start with `:` and expand to patterns that handle tool-generated
 
 | Constant | Matches |
 |----------|---------|
-| `:git_commit` | `git commit`, `git -C /path commit` |
+| `:git_commit` | `git commit`, `git -C /path commit`, `git -c key=val commit` |
 | `:git_push` | `git push`, `git -C /path push` |
-| `:git_push_force` | `git push --force`, `git -C /path push --force` |
+| `:git_push_force` | `--force`, `-f`, `--force-with-lease`, and `+refspec` variants |
 | `:git_reset` | `git reset`, `git -C /path reset` |
 | `:git_rebase` | `git rebase`, `git -C /path rebase` |
 | `:git_checkout` | `git checkout`, `git -C /path checkout` |
+| `:git_switch` | `git switch`, `git -C /path switch` |
 | `:git_merge` | `git merge`, `git -C /path merge` |
 | `:git_stash` | `git stash`, `git -C /path stash` |
+| `:git_restore` | `git restore`, `git -C /path restore` |
 
-Constants are tested to reject false positives — `:git_reset` does not match `git commit -m "reset things"`. Unknown constants fail open with a stderr warning.
+All constants handle global git options between `git` and the subcommand (`-C <path>`, `-c <key=value>`, `--git-dir`, relative paths). Constants are adversarially tested to reject false positives — `:git_reset` does not match `git commit -m "reset things"`, and `:git_push_force` catches `git push -f`, `git push origin +main`, and `--force-with-lease`. Unknown constants fail open with a stderr warning.
 
 **`match_field`** — Which field of `tool_input` to match against. Only meaningful for `PreToolUse` events. Each tool has a default:
 

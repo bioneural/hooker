@@ -40,8 +40,10 @@
 #       match: "pattern" | :constant              # regex on tool input content, or a
 #                                                # predefined constant (see MATCH_CONSTANTS).
 #                                                # constants: :git_commit, :git_push,
-#                                                # :git_push_force, :git_reset, :git_rebase,
-#                                                # :git_checkout, :git_merge, :git_stash
+#                                                # :git_push_force (--force, -f, +refspec),
+#                                                # :git_reset, :git_rebase, :git_checkout,
+#                                                # :git_switch, :git_merge, :git_stash,
+#                                                # :git_restore
 #       match_field: command | file_path | ...   # which tool_input field to match against
 #       transform_field: content | command | ... # which tool_input field the transform rewrites
 #                                                # (defaults to match_field; use when match and
@@ -74,20 +76,28 @@ module Hooker
   # These handle tool-generated command variations (e.g. `git -C /path commit`
   # instead of `git commit`) so policy authors don't need to know the details.
   #
-  # The GIT_PREFIX pattern matches `git` followed by zero or more global flags
-  # (tokens starting with - or /) before the subcommand. This prevents false
-  # positives from subcommand words appearing in commit messages or arguments.
-  GIT_PREFIX = 'git\b(\s+[-/]\S+)*\s+'
+  # GIT_PREFIX matches `git` followed by zero or more global option tokens before
+  # the subcommand. Tokens are recognized by containing characters typical of
+  # flags (-), paths (/.), or config values (=). This handles:
+  #   git -C /abs/path commit          (flag + absolute path)
+  #   git -C relative/dir commit       (flag + relative path with /)
+  #   git -c user.name=evil commit     (flag + config key=value)
+  #   git --bare commit                (long flag)
+  # While rejecting subcommand words in arguments:
+  #   git commit -m "reset things"     (does NOT match :git_reset)
+  GIT_PREFIX = 'git\b(\s+\S*[-/.=]\S*)*\s+'
 
   MATCH_CONSTANTS = {
     ':git_commit'     => "#{GIT_PREFIX}commit\\b",
     ':git_push'       => "#{GIT_PREFIX}push\\b",
-    ':git_push_force' => "#{GIT_PREFIX}push\\b.*--force",
+    ':git_push_force' => "#{GIT_PREFIX}push\\b.*(--force\\b|-f\\b|\\+\\S)",
     ':git_reset'      => "#{GIT_PREFIX}reset\\b",
     ':git_rebase'     => "#{GIT_PREFIX}rebase\\b",
     ':git_checkout'   => "#{GIT_PREFIX}checkout\\b",
+    ':git_switch'     => "#{GIT_PREFIX}switch\\b",
     ':git_merge'      => "#{GIT_PREFIX}merge\\b",
-    ':git_stash'      => "#{GIT_PREFIX}stash\\b"
+    ':git_stash'      => "#{GIT_PREFIX}stash\\b",
+    ':git_restore'    => "#{GIT_PREFIX}restore\\b"
   }.freeze
 
   DEFAULT_MATCH_FIELDS = {

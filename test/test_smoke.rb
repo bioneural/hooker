@@ -507,32 +507,73 @@ end
 
 # Each constant is tested with: (1) plain form, (2) git -C /path form,
 # (3) a negative case that should NOT match.
+# Adversarial test vectors. Each constant must catch:
+# - Plain form (git subcommand)
+# - Tool-generated form (git -C /path subcommand)
+# - Flag arguments that break naive prefix patterns (git -c key=val subcommand)
+# - Relative path arguments (git -C reldir subcommand)
+# And must NOT match:
+# - Subcommand words in commit messages or arguments
+# - Unrelated commands
 MATCH_CONSTANT_CASES = [
   { constant: ':git_commit',
-    yes: ['git commit -m "test"', 'git -C /Users/me/project commit -m "test"'],
+    yes: ['git commit -m "test"',
+          'git -C /Users/me/project commit -m "test"',
+          'git -c user.name=evil commit -m "test"',
+          'git -C relative/dir commit -m "test"'],
     no:  ['git push origin main', 'ls -la'] },
   { constant: ':git_push',
-    yes: ['git push origin main', 'git -C /app push origin main'],
+    yes: ['git push origin main',
+          'git -C /app push origin main',
+          'git -c push.default=current push'],
     no:  ['git commit -m "x"', 'git pull origin main'] },
   { constant: ':git_push_force',
-    yes: ['git push --force origin main', 'git -C /app push --force origin main',
-          'git push origin main --force'],
-    no:  ['git push origin main', 'git -C /app push origin main'] },
+    yes: ['git push --force origin main',
+          'git -C /app push --force origin main',
+          'git push origin main --force',
+          'git push --force-with-lease origin main',
+          'git push -f origin main',            # short flag bypass
+          'git -C /app push -f origin main',    # short flag + -C
+          'git push origin +main',              # refspec force syntax
+          'git push origin +refs/heads/main',   # full refspec force
+          'git push -u -f origin main'],        # multiple short flags
+    no:  ['git push origin main',
+          'git -C /app push origin main',
+          'git push origin feature-fix'] },     # -f inside branch name
   { constant: ':git_reset',
-    yes: ['git reset --hard HEAD~1', 'git -C /app reset --soft HEAD'],
+    yes: ['git reset --hard HEAD~1',
+          'git -C /app reset --soft HEAD',
+          'git -c advice.detachedHead=false reset HEAD'],
     no:  ['git commit -m "reset things"', 'echo reset'] },
   { constant: ':git_rebase',
-    yes: ['git rebase main', 'git -C /app rebase --onto main feature'],
+    yes: ['git rebase main',
+          'git -C /app rebase --onto main feature',
+          'git -c rebase.autoStash=true rebase main'],
     no:  ['git commit -m "rebase stuff"', 'git merge main'] },
   { constant: ':git_checkout',
-    yes: ['git checkout feature', 'git -C /app checkout -b new-branch'],
+    yes: ['git checkout feature',
+          'git -C /app checkout -b new-branch',
+          'git -c core.autocrlf=true checkout main'],
     no:  ['git commit -m "checkout fix"', 'git switch main'] },
   { constant: ':git_merge',
-    yes: ['git merge feature', 'git -C /app merge --no-ff feature'],
+    yes: ['git merge feature',
+          'git -C /app merge --no-ff feature',
+          'git -c merge.ff=false merge main'],
     no:  ['git commit -m "merge conflict"', 'git rebase main'] },
   { constant: ':git_stash',
-    yes: ['git stash', 'git -C /app stash pop', 'git stash list'],
-    no:  ['git commit -m "stash changes"', 'echo stash'] }
+    yes: ['git stash', 'git -C /app stash pop', 'git stash list',
+          'git -c stash.showStat=true stash show'],
+    no:  ['git commit -m "stash changes"', 'echo stash'] },
+  { constant: ':git_switch',
+    yes: ['git switch main',
+          'git -C /app switch -c new-branch',
+          'git -c advice.detachedHead=false switch --detach HEAD~1'],
+    no:  ['git commit -m "switch to new approach"', 'git checkout main'] },
+  { constant: ':git_restore',
+    yes: ['git restore .',
+          'git -C /app restore --staged file.txt',
+          'git -c core.autocrlf=true restore --source HEAD file.txt'],
+    no:  ['git commit -m "restore backup"', 'git reset --hard'] }
 ].freeze
 
 def test_match_constants_all
