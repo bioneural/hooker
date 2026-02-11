@@ -37,19 +37,60 @@ def assert(label, condition, detail = nil)
   end
 end
 
-def run_hooker(input_hash, policies_rb:, context_files: {}, env: {})
+def run_hooker(input_hash, policies_rb:, context_files: {}, env: {},
+               parent_policies_rb: nil, parent_context_files: {},
+               subdir: nil, subdir_policies_rb: nil, subdir_context_files: {})
   Dir.mktmpdir('hooker-smoke') do |tmpdir|
-    claude_dir = File.join(tmpdir, '.claude')
-    FileUtils.mkdir_p(claude_dir)
-    File.write(File.join(claude_dir, 'policies.rb'), policies_rb)
+    if parent_policies_rb
+      parent_dir = tmpdir
+      project_dir = File.join(tmpdir, 'project')
+      FileUtils.mkdir_p(project_dir)
 
-    context_files.each do |rel_path, content|
-      abs = File.join(tmpdir, rel_path)
-      FileUtils.mkdir_p(File.dirname(abs))
-      File.write(abs, content)
+      parent_claude = File.join(parent_dir, '.claude')
+      FileUtils.mkdir_p(parent_claude)
+      File.write(File.join(parent_claude, 'policies.rb'), parent_policies_rb)
+      parent_context_files.each do |rel_path, content|
+        abs = File.join(parent_dir, rel_path)
+        FileUtils.mkdir_p(File.dirname(abs))
+        File.write(abs, content)
+      end
+
+      claude_dir = File.join(project_dir, '.claude')
+      FileUtils.mkdir_p(claude_dir)
+      File.write(File.join(claude_dir, 'policies.rb'), policies_rb)
+      context_files.each do |rel_path, content|
+        abs = File.join(project_dir, rel_path)
+        FileUtils.mkdir_p(File.dirname(abs))
+        File.write(abs, content)
+      end
+
+      cwd_dir = project_dir
+    else
+      claude_dir = File.join(tmpdir, '.claude')
+      FileUtils.mkdir_p(claude_dir)
+      File.write(File.join(claude_dir, 'policies.rb'), policies_rb)
+      context_files.each do |rel_path, content|
+        abs = File.join(tmpdir, rel_path)
+        FileUtils.mkdir_p(File.dirname(abs))
+        File.write(abs, content)
+      end
+      cwd_dir = tmpdir
     end
 
-    input = input_hash.is_a?(String) ? input_hash : JSON.generate(input_hash.merge('cwd' => tmpdir))
+    if subdir && subdir_policies_rb
+      sub_path = File.join(cwd_dir, subdir)
+      sub_claude = File.join(sub_path, '.claude')
+      FileUtils.mkdir_p(sub_claude)
+      File.write(File.join(sub_claude, 'policies.rb'), subdir_policies_rb)
+      subdir_context_files.each do |rel_path, content|
+        abs = File.join(sub_path, rel_path)
+        FileUtils.mkdir_p(File.dirname(abs))
+        File.write(abs, content)
+      end
+      cwd_dir = sub_path
+    end
+
+    input = input_hash.is_a?(String) ? input_hash : JSON.generate(input_hash.merge('cwd' => cwd_dir))
 
     merged_env = env.transform_keys(&:to_s)
     stdout, stderr, status = Open3.capture3(merged_env, HOOKER, stdin_data: input)
@@ -624,6 +665,237 @@ def test_dsl_invalid_ruby_failopen
   assert 'stderr mentions failure', result[:stderr].include?('failed to load policies')
 end
 
+# -- File Sugar Tests --
+
+def test_file_sugar_string_match
+  puts "\nfile: string exact match"
+  policies = <<~'RUBY'
+    policy "Block .env" do
+      on :PreToolUse, tool: "Edit|Write", file: ".env"
+      gate "Cannot edit .env files."
+    end
+  RUBY
+
+  input = { hook_event_name: 'PreToolUse', tool_name: 'Write',
+            tool_input: { file_path: '/app/.env', content: 'SECRET=x' } }
+  result = run_hooker(input, policies_rb: policies)
+  output = parse_output(result)
+  assert 'matches .env file', output&.dig('hookSpecificOutput', 'permissionDecision') == 'deny'
+end
+
+def test_file_sugar_string_no_partial
+  puts "\nfile: string does not partial-match"
+  policies = <<~'RUBY'
+    policy "Block .env" do
+      on :PreToolUse, tool: "Edit|Write", file: ".env"
+      gate "Cannot edit .env files."
+    end
+  RUBY
+
+  input_env = { hook_event_name: 'PreToolUse', tool_name: 'Write',
+                tool_input: { file_path: '/app/.environment', content: 'x' } }
+  result_env = run_hooker(input_env, policies_rb: policies)
+  assert 'does not match .environment', result_env[:stdout].strip.empty?
+
+  input_prefix = { hook_event_name: 'PreToolUse', tool_name: 'Write',
+                   tool_input: { file_path: '/app/X.env', content: 'x' } }
+  result_prefix = run_hooker(input_prefix, policies_rb: policies)
+  assert 'does not match X.env', result_prefix[:stdout].strip.empty?
+end
+
+def test_file_sugar_regex
+  puts "\nfile: regex match (unanchored)"
+  policies = <<~'RUBY'
+    policy "Block env files" do
+      on :PreToolUse, tool: "Edit|Write", file: /\.env/
+      gate "Cannot edit env files."
+    end
+  RUBY
+
+  input = { hook_event_name: 'PreToolUse', tool_name: 'Write',
+            tool_input: { file_path: '/app/.env.local', content: 'x' } }
+  result = run_hooker(input, policies_rb: policies)
+  output = parse_output(result)
+  assert 'regex matches .env.local', output&.dig('hookSpecificOutput', 'permissionDecision') == 'deny'
+end
+
+def test_file_sugar_string_with_path
+  puts "\nfile: string with path components"
+  policies = <<~'RUBY'
+    policy "Block config" do
+      on :PreToolUse, tool: "Write", file: "src/config.py"
+      gate "Cannot write config."
+    end
+  RUBY
+
+  input = { hook_event_name: 'PreToolUse', tool_name: 'Write',
+            tool_input: { file_path: '/app/src/config.py', content: 'x' } }
+  result = run_hooker(input, policies_rb: policies)
+  output = parse_output(result)
+  assert 'matches path with components', output&.dig('hookSpecificOutput', 'permissionDecision') == 'deny'
+
+  input_other = { hook_event_name: 'PreToolUse', tool_name: 'Write',
+                  tool_input: { file_path: '/app/other/config.py', content: 'x' } }
+  result_other = run_hooker(input_other, policies_rb: policies)
+  assert 'does not match different path', result_other[:stdout].strip.empty?
+end
+
+# -- Hierarchy Tests --
+
+def test_hierarchy_both_levels_evaluate
+  puts "\nhierarchy: system + project policies both evaluate"
+  parent_policies = <<~'RUBY'
+    policy "System rules" do
+      on :PreToolUse, tool: "Bash"
+      inject "SYSTEM_RULES.md"
+    end
+  RUBY
+  project_policies = <<~'RUBY'
+    policy "Project rules" do
+      on :PreToolUse, tool: "Bash"
+      inject "PROJECT_RULES.md"
+    end
+  RUBY
+  input = { hook_event_name: 'PreToolUse', tool_name: 'Bash',
+            tool_input: { command: 'echo hello' } }
+
+  result = run_hooker(input, policies_rb: project_policies,
+                      parent_policies_rb: parent_policies,
+                      parent_context_files: { 'SYSTEM_RULES.md' => 'System rule content.' },
+                      context_files: { 'PROJECT_RULES.md' => 'Project rule content.' })
+  output = parse_output(result)
+  ctx = output&.dig('hookSpecificOutput', 'additionalContext')
+
+  assert 'both levels have context', !ctx.nil?
+  assert 'system rules present', ctx&.include?('System rule content.')
+  assert 'project rules present', ctx&.include?('Project rule content.')
+end
+
+def test_hierarchy_system_gate_blocks
+  puts "\nhierarchy: system gate blocks even without project gate"
+  parent_policies = <<~'RUBY'
+    policy "System block" do
+      on :PreToolUse, tool: "Bash", match: "rm -rf"
+      gate "System policy: rm -rf denied."
+    end
+  RUBY
+  project_policies = <<~'RUBY'
+    policy "Project inject" do
+      on :PreToolUse, tool: "Bash"
+      inject "NOTES.md"
+    end
+  RUBY
+  input = { hook_event_name: 'PreToolUse', tool_name: 'Bash',
+            tool_input: { command: 'rm -rf /' } }
+
+  result = run_hooker(input, policies_rb: project_policies,
+                      parent_policies_rb: parent_policies,
+                      context_files: { 'NOTES.md' => 'notes' })
+  output = parse_output(result)
+
+  assert 'system gate fires', output&.dig('hookSpecificOutput', 'permissionDecision') == 'deny'
+  assert 'reason from system', output&.dig('hookSpecificOutput', 'permissionDecisionReason') == 'System policy: rm -rf denied.'
+end
+
+def test_hierarchy_directory_gate
+  puts "\nhierarchy: directory-level gate blocks for subdirectory cwd"
+  project_policies = <<~'RUBY'
+    policy "Project inject" do
+      on :PreToolUse, tool: "Bash"
+      inject "NOTES.md"
+    end
+  RUBY
+  subdir_policies = <<~'RUBY'
+    policy "Sensitive gate" do
+      on :PreToolUse, tool: "Bash", match: "."
+      gate "Sensitive directory: all commands blocked."
+    end
+  RUBY
+  input = { hook_event_name: 'PreToolUse', tool_name: 'Bash',
+            tool_input: { command: 'ls' } }
+
+  result = run_hooker(input, policies_rb: project_policies,
+                      subdir: 'src/sensitive', subdir_policies_rb: subdir_policies,
+                      context_files: { 'NOTES.md' => 'notes' })
+  output = parse_output(result)
+
+  assert 'subdir gate fires', output&.dig('hookSpecificOutput', 'permissionDecision') == 'deny'
+  assert 'reason from subdir', output&.dig('hookSpecificOutput', 'permissionDecisionReason')&.include?('Sensitive directory')
+end
+
+def test_hierarchy_context_resolution
+  puts "\nhierarchy: context files resolve relative to each policy's root"
+  parent_policies = <<~'RUBY'
+    policy "System inject" do
+      on :PreToolUse, tool: "Bash"
+      inject "RULES.md"
+    end
+  RUBY
+  project_policies = <<~'RUBY'
+    policy "Project inject" do
+      on :PreToolUse, tool: "Bash"
+      inject "RULES.md"
+    end
+  RUBY
+  input = { hook_event_name: 'PreToolUse', tool_name: 'Bash',
+            tool_input: { command: 'echo hello' } }
+
+  result = run_hooker(input, policies_rb: project_policies,
+                      parent_policies_rb: parent_policies,
+                      parent_context_files: { 'RULES.md' => 'System rules here.' },
+                      context_files: { 'RULES.md' => 'Project rules here.' })
+  output = parse_output(result)
+  ctx = output&.dig('hookSpecificOutput', 'additionalContext')
+
+  assert 'context resolves per root', !ctx.nil?
+  assert 'system rules present', ctx&.include?('System rules here.')
+  assert 'project rules present', ctx&.include?('Project rules here.')
+end
+
+def test_hierarchy_syntax_error_skips_file
+  puts "\nhierarchy: syntax error in one level doesn't break others"
+  parent_policies = "this is not valid ruby {{{"
+  project_policies = <<~'RUBY'
+    policy "Project gate" do
+      on :PreToolUse, tool: "Bash", match: "rm"
+      gate "Blocked by project."
+    end
+  RUBY
+  input = { hook_event_name: 'PreToolUse', tool_name: 'Bash',
+            tool_input: { command: 'rm -rf /' } }
+
+  result = run_hooker(input, policies_rb: project_policies,
+                      parent_policies_rb: parent_policies)
+  output = parse_output(result)
+
+  assert 'project policy still fires', output&.dig('hookSpecificOutput', 'permissionDecision') == 'deny'
+  assert 'stderr mentions failure', result[:stderr].include?('failed to load policies')
+end
+
+def test_hierarchy_broadest_scope_first
+  puts "\nhierarchy: broadest scope fires first"
+  parent_policies = <<~'RUBY'
+    policy "System gate" do
+      on :PreToolUse, tool: "Bash", match: "rm"
+      gate "System blocked."
+    end
+  RUBY
+  project_policies = <<~'RUBY'
+    policy "Project gate" do
+      on :PreToolUse, tool: "Bash", match: "rm"
+      gate "Project blocked."
+    end
+  RUBY
+  input = { hook_event_name: 'PreToolUse', tool_name: 'Bash',
+            tool_input: { command: 'rm -rf /' } }
+
+  result = run_hooker(input, policies_rb: project_policies,
+                      parent_policies_rb: parent_policies)
+  output = parse_output(result)
+
+  assert 'system gate fires first', output&.dig('hookSpecificOutput', 'permissionDecisionReason') == 'System blocked.'
+end
+
 # -- Runner --
 
 def run_tests
@@ -655,6 +927,16 @@ def run_tests
   test_dsl_regex_literal_match
   test_dsl_symbol_match_constant
   test_dsl_invalid_ruby_failopen
+  test_file_sugar_string_match
+  test_file_sugar_string_no_partial
+  test_file_sugar_regex
+  test_file_sugar_string_with_path
+  test_hierarchy_both_levels_evaluate
+  test_hierarchy_system_gate_blocks
+  test_hierarchy_directory_gate
+  test_hierarchy_context_resolution
+  test_hierarchy_syntax_error_skips_file
+  test_hierarchy_broadest_scope_first
 
   puts '=' * 40
   puts "#{$pass} passed, #{$fail} failed"

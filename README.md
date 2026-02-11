@@ -81,13 +81,25 @@ end
 
 That is a complete, working policy. Force pushes are now structurally denied. The `:git_push_force` constant handles command variations the agent may generate (like `git -C /path push --force`) — no regex knowledge required.
 
+### Policy Scopes
+
+hooker discovers `.claude/policies.rb` at multiple directory levels by walking up from `cwd`. Three natural scopes emerge:
+
+- **System-wide** — `~/.claude/policies.rb` — personal rules that apply to all projects
+- **Project-wide** — `<project>/.claude/policies.rb` — the most common location
+- **Directory-wide** — `<project>/src/sensitive/.claude/policies.rb` — rules for a subtree
+
+Broader scopes evaluate first. A system-wide gate fires before a project-level gate. Context files (for `inject` and `transform`) resolve relative to each policy file's root directory — a system-wide `inject "RULES.md"` reads `~/RULES.md`, a project-level one reads `<project>/RULES.md`.
+
+A syntax error in one file skips that file. Other levels still evaluate.
+
 ## Examples
 
 Block edits to sensitive files:
 
 ```ruby
 policy "No env edits" do
-  on :PreToolUse, tool: "Edit|Write", match: /\.env/, match_field: :file_path
+  on :PreToolUse, tool: "Edit|Write", file: ".env"
   gate "Modifying .env files is prohibited."
 end
 ```
@@ -108,7 +120,7 @@ Enforce a license header on new Python files (`field:` targets `content` while m
 
 ```ruby
 policy "License header" do
-  on :PreToolUse, tool: "Write", match: /\.py$/, match_field: :file_path
+  on :PreToolUse, tool: "Write", file: /\.py$/
   transform context: "LICENSE_HEADER.txt",
     field: :content,
     prompt: "If this file does not already begin with the license header from " \
@@ -132,7 +144,7 @@ end
 
 ## Architecture
 
-hooker reads a JSON event from stdin. It parses the event, extracts `cwd`, and traverses upward from that directory to locate `.claude/policies.rb`. If no policies file exists, the action is allowed. Exit.
+hooker reads a JSON event from stdin. It parses the event, extracts `cwd`, and walks upward from that directory to the filesystem root, collecting every `.claude/policies.rb` found along the way. Files are merged broadest-first — a policy at `~/` evaluates before one at `~/project/`, which evaluates before one at `~/project/src/sensitive/`. If no policies files exist, the action is allowed. Exit.
 
 Each policy is evaluated in declaration order. Three conditions are AND-ed:
 
@@ -148,13 +160,23 @@ Surviving policies are grouped by type. Execution follows fixed priority:
 2. **Transforms** — all matching transforms are accumulated. Context files are merged and deduplicated. Prompts are numbered and concatenated. One `claude -p` call executes the combined transformation. The rewritten value replaces the original tool input field.
 3. **Injects** — all matching injects are accumulated. Context files are merged, read, wrapped in `<filename>` tags, and returned as additional context.
 
+Context files (for `inject` and `transform`) resolve relative to the directory containing the `.claude/` that defines the policy. A system-wide policy's `inject "RULES.md"` reads `~/RULES.md`; a project policy's reads `<project>/RULES.md`. A syntax error in one policy file skips that file — other levels still evaluate.
+
 If nothing matches, hooker exits silently with code 0.
 
 Every error path fails open. Invalid JSON, missing policies file, malformed regex, invalid Ruby, unreachable `claude` CLI, unreachable `ollama` — all result in allowing the action. This is deliberate. hooker is a policy layer, not a security boundary.
 
 ## Policy DSL
 
-Policies are defined in `.claude/policies.rb` using a Ruby DSL. Each policy is a block:
+Policies are defined in `.claude/policies.rb` using a Ruby DSL. Multiple files are discovered by walking up from `cwd`:
+
+```
+~/.claude/policies.rb              # system-wide (all projects)
+<project>/.claude/policies.rb      # project-wide
+<project>/sub/.claude/policies.rb  # directory-wide (subtree)
+```
+
+All files are merged broadest-first into a single policy list. Each policy is a block:
 
 ```ruby
 policy "name" do
@@ -164,7 +186,7 @@ policy "name" do
 end
 ```
 
-### `on(event, tool:, match:, match_field:)`
+### `on(event, tool:, match:, match_field:, file:)`
 
 Declares what the policy matches against. All parameters except `event` are optional.
 
@@ -199,6 +221,22 @@ For `UserPromptSubmit` events, the match is against the prompt text.
 
 If the tool is not in this table and no `match_field:` is specified, the fallback is `command`. If the resolved field is absent from `tool_input`, the entire `tool_input` JSON is matched instead.
 
+**`file:`** — Sugar for matching against `file_path`. Sets `match_field: :file_path` automatically. Accepts two forms:
+- **String** — exact filename match. The string is auto-escaped (dots are literal) and anchored to path component boundaries. `file: ".env"` matches `/app/.env` but not `/app/.environment` or `/app/X.env`.
+- **Regexp** — unanchored regex against the full `file_path`. `file: /\.env/` matches `/app/.env.local`.
+
+If `file:` is specified, `match:` and `match_field:` are ignored.
+
+```ruby
+# These are equivalent:
+on :PreToolUse, tool: "Write", match: /\.env/, match_field: :file_path
+on :PreToolUse, tool: "Write", file: /\.env/
+
+# But file: with a string is an exact match (not regex):
+on :PreToolUse, tool: "Write", file: ".env"     # matches .env only
+on :PreToolUse, tool: "Write", file: "README.md" # matches README.md only
+```
+
 ### Match Constants
 
 Match constants start with `:` and expand to patterns that handle tool-generated command variations (like `git -C /path commit` instead of `git commit`). Use Ruby symbols in the DSL:
@@ -228,7 +266,7 @@ Blocks the action. Returns a deny decision to Claude Code.
 
 Rewrites the action via a side-channel `claude -p` call.
 
-**`context:`** — File path or array of file paths (relative to project root) to read and include in the transform prompt. Files are wrapped in `<filename>` tags.
+**`context:`** — File path or array of file paths (relative to the policy file's root directory) to read and include in the transform prompt. Files are wrapped in `<filename>` tags.
 
 **`prompt:`** — The instruction sent to the model. Describes the transformation to perform.
 
@@ -236,11 +274,40 @@ Rewrites the action via a side-channel `claude -p` call.
 
 **`model:`** — Model for the `claude -p` call. Passed as `--model <value>`. If omitted, uses the `claude` CLI default.
 
+**Assembled prompt.** hooker builds the prompt sent to `claude -p` from four parts, in order:
+
+```
+<context>
+<COMMIT_STYLE.md>
+[contents of COMMIT_STYLE.md]
+</COMMIT_STYLE.md>
+</context>
+
+<current_input>
+{
+  "command": "git commit -m \"fix bug in auth\""
+}
+</current_input>
+
+<instructions>
+Rewrite this commit message to follow the conventions in COMMIT_STYLE.md.
+</instructions>
+
+Return ONLY the transformed value. No explanation, no markdown fencing.
+```
+
+- **`<context>`** — present only when `context:` files are specified. Each file is wrapped in `<filename>` tags using the basename (not the full path). Multiple files appear as siblings inside the `<context>` block.
+- **`<current_input>`** — the full `tool_input` JSON from the hook event, pretty-printed. For a Bash tool call this includes `command`; for a Write call it includes `file_path` and `content`.
+- **`<instructions>`** — the `prompt:` string. When multiple transforms match the same event, their prompts are numbered (`1. ...`, `2. ...`) and concatenated.
+- **Trailing directive** — a fixed suffix instructing the model to return only the transformed value.
+
+The model's response replaces the value of the target field (`field:`, or the default match field). Write your `prompt:` knowing that the model can reference context files by their `<filename>` tags and can see the full tool input JSON.
+
 ### `inject(*files)`
 
 Surfaces context files to the agent before it reasons.
 
-**`files`** — One or more file paths (relative to project root) to read and return as additional context. Files are wrapped in `<filename>` tags. Multiple matching injects have their context files merged and deduplicated.
+**`files`** — One or more file paths (relative to the policy file's root directory) to read and return as additional context. Files are wrapped in `<filename>` tags. Multiple matching injects have their context files merged and deduplicated.
 
 ### `when_prompt(condition, model:)`
 

@@ -44,19 +44,60 @@ def skip(label, reason)
   puts "  SKIP  #{label} (#{reason})"
 end
 
-def run_hooker(input_hash, policies_rb:, context_files: {}, env: {})
+def run_hooker(input_hash, policies_rb:, context_files: {}, env: {},
+               parent_policies_rb: nil, parent_context_files: {},
+               subdir: nil, subdir_policies_rb: nil, subdir_context_files: {})
   Dir.mktmpdir('hooker-e2e') do |tmpdir|
-    claude_dir = File.join(tmpdir, '.claude')
-    FileUtils.mkdir_p(claude_dir)
-    File.write(File.join(claude_dir, 'policies.rb'), policies_rb)
+    if parent_policies_rb
+      parent_dir = tmpdir
+      project_dir = File.join(tmpdir, 'project')
+      FileUtils.mkdir_p(project_dir)
 
-    context_files.each do |rel_path, content|
-      abs = File.join(tmpdir, rel_path)
-      FileUtils.mkdir_p(File.dirname(abs))
-      File.write(abs, content)
+      parent_claude = File.join(parent_dir, '.claude')
+      FileUtils.mkdir_p(parent_claude)
+      File.write(File.join(parent_claude, 'policies.rb'), parent_policies_rb)
+      parent_context_files.each do |rel_path, content|
+        abs = File.join(parent_dir, rel_path)
+        FileUtils.mkdir_p(File.dirname(abs))
+        File.write(abs, content)
+      end
+
+      claude_dir = File.join(project_dir, '.claude')
+      FileUtils.mkdir_p(claude_dir)
+      File.write(File.join(claude_dir, 'policies.rb'), policies_rb)
+      context_files.each do |rel_path, content|
+        abs = File.join(project_dir, rel_path)
+        FileUtils.mkdir_p(File.dirname(abs))
+        File.write(abs, content)
+      end
+
+      cwd_dir = project_dir
+    else
+      claude_dir = File.join(tmpdir, '.claude')
+      FileUtils.mkdir_p(claude_dir)
+      File.write(File.join(claude_dir, 'policies.rb'), policies_rb)
+      context_files.each do |rel_path, content|
+        abs = File.join(tmpdir, rel_path)
+        FileUtils.mkdir_p(File.dirname(abs))
+        File.write(abs, content)
+      end
+      cwd_dir = tmpdir
     end
 
-    input = JSON.generate(input_hash.merge('cwd' => tmpdir))
+    if subdir && subdir_policies_rb
+      sub_path = File.join(cwd_dir, subdir)
+      sub_claude = File.join(sub_path, '.claude')
+      FileUtils.mkdir_p(sub_claude)
+      File.write(File.join(sub_claude, 'policies.rb'), subdir_policies_rb)
+      subdir_context_files.each do |rel_path, content|
+        abs = File.join(sub_path, rel_path)
+        FileUtils.mkdir_p(File.dirname(abs))
+        File.write(abs, content)
+      end
+      cwd_dir = sub_path
+    end
+
+    input = JSON.generate(input_hash.merge('cwd' => cwd_dir))
 
     merged_env = env.transform_keys(&:to_s)
     stdout, stderr, status = Open3.capture3(merged_env, HOOKER, stdin_data: input)
@@ -430,6 +471,81 @@ def test_when_prompt_no_fires_without_classifier
     output&.dig('hookSpecificOutput', 'additionalContext')&.include?('Panel content')
 end
 
+# -- Hierarchy Tests (shimmed) --
+
+def test_hierarchy_multi_level_transforms
+  puts "\nhierarchy: multi-level transforms with per-root context"
+  parent_policies = <<~'RUBY'
+    policy "System transform" do
+      on :PreToolUse, tool: "Bash", match: "git commit"
+      transform context: "STYLE.md",
+        prompt: "Add emoji prefix."
+    end
+  RUBY
+  project_policies = <<~'RUBY'
+    policy "Project transform" do
+      on :PreToolUse, tool: "Bash", match: "git commit"
+      transform context: "IDENTITY.md",
+        prompt: "Make it lowercase."
+    end
+  RUBY
+  input = { hook_event_name: 'PreToolUse', tool_name: 'Bash',
+            tool_input: { command: 'git commit -m "Fix Bug"' } }
+
+  claude_shim = <<~'SH'
+    #!/bin/sh
+    INPUT=$(cat)
+    if echo "$INPUT" | grep -q "emoji" && echo "$INPUT" | grep -q "lowercase" && echo "$INPUT" | grep -q "System style" && echo "$INPUT" | grep -q "I am Project"; then
+      echo 'git commit -m "both levels received"'
+    else
+      echo "SHIM_ERROR: missing expected content" >&2
+      exit 1
+    fi
+  SH
+
+  with_shims('claude' => claude_shim) do |path|
+    result = run_hooker(input, policies_rb: project_policies,
+                        parent_policies_rb: parent_policies,
+                        parent_context_files: { 'STYLE.md' => 'System style guide.' },
+                        context_files: { 'IDENTITY.md' => 'I am Project.' },
+                        env: { 'PATH' => path })
+    output = parse_output(result)
+
+    assert 'multi-level transforms accumulated',
+      output&.dig('hookSpecificOutput', 'updatedInput', 'command')&.include?('both levels')
+    assert 'no shim error', !result[:stderr].include?('SHIM_ERROR')
+  end
+end
+
+def test_hierarchy_multi_level_injects
+  puts "\nhierarchy: multi-level injects with context from different roots"
+  parent_policies = <<~'RUBY'
+    policy "System inject" do
+      on :PreToolUse, tool: "Bash"
+      inject "GLOBAL.md"
+    end
+  RUBY
+  project_policies = <<~'RUBY'
+    policy "Project inject" do
+      on :PreToolUse, tool: "Bash"
+      inject "LOCAL.md"
+    end
+  RUBY
+  input = { hook_event_name: 'PreToolUse', tool_name: 'Bash',
+            tool_input: { command: 'echo hello' } }
+
+  result = run_hooker(input, policies_rb: project_policies,
+                      parent_policies_rb: parent_policies,
+                      parent_context_files: { 'GLOBAL.md' => 'Global context.' },
+                      context_files: { 'LOCAL.md' => 'Local context.' })
+  output = parse_output(result)
+  ctx = output&.dig('hookSpecificOutput', 'additionalContext')
+
+  assert 'has additionalContext', !ctx.nil?
+  assert 'global context present', ctx&.include?('Global context.')
+  assert 'local context present', ctx&.include?('Local context.')
+end
+
 # -- Live Tests (opt-in) --
 #
 # These tests create real git repos, wire in hooker with real policies,
@@ -770,6 +886,10 @@ def run_tests
   test_when_prompt_generates_classifier_prompt
   test_when_prompt_with_custom_model
   test_when_prompt_no_fires_without_classifier
+
+  # Shimmed hierarchy
+  test_hierarchy_multi_level_transforms
+  test_hierarchy_multi_level_injects
 
   # Live (opt-in) — real git repos, real claude -p, real ollama
   test_live_gate_deny
