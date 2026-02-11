@@ -6,12 +6,11 @@
 # MIT License — Copyright (c) 2026 Fort Asset LLC
 #
 # Reads hook event JSON from stdin, evaluates it against policies defined
-# in .claude/policies.yaml, and returns a decision on stdout.
+# in .claude/policies.rb, and returns a decision on stdout.
 #
 # Three policy types:
 #
-#   gate      — blocks an action. Regex match on tool input. Deterministic.
-#               Zero cost. First matching gate wins.
+#   gate      — blocks an action. First matching gate wins.
 #
 #   transform — rewrites an action via a side-channel `claude -p` call.
 #               The transformation happens outside the main agent's context
@@ -21,57 +20,105 @@
 #   inject    — surfaces context before the agent acts. All matching injects
 #               accumulate. Context files are read and concatenated.
 #
-# Any policy can include a `classifier` field to gate it behind a local
-# ollama model call. The classifier runs after regex matching and before
-# execution. Use this for intelligent filtering (e.g., "does this prompt
-# warrant panel review?").
-#
 # Execution priority: gates > transforms > injects
 # Fail-open: every error path allows the action.
 #
-# Policy schema (.claude/policies.yaml):
+# Policy DSL (.claude/policies.rb):
 #
-#   policies:
-#     - name: human-readable label
-#       event: PreToolUse | UserPromptSubmit     # hook event to match (Claude Code hook events)
-#       tool: Bash | Edit|Write | ...            # regex on tool name (PreToolUse only)
-#                                                # known tools: Bash, Edit, MultiEdit, Write, Read,
-#                                                # Glob, Grep, NotebookEdit, Task, WebFetch, WebSearch
-#       match: "pattern" | :constant              # regex on tool input content, or a
-#                                                # predefined constant (see MATCH_CONSTANTS).
-#                                                # constants: :git_commit, :git_push,
-#                                                # :git_push_force (--force, -f, +refspec),
-#                                                # :git_reset, :git_rebase, :git_checkout,
-#                                                # :git_switch, :git_merge, :git_stash,
-#                                                # :git_restore
-#       match_field: command | file_path | ...   # which tool_input field to match against
-#       transform_field: content | command | ... # which tool_input field the transform rewrites
-#                                                # (defaults to match_field; use when match and
-#                                                # transform target different fields, e.g. match
-#                                                # on file_path but rewrite content)
-#       type: gate | transform | inject          # policy type
-#       message: "reason"                        # gate: denial message
-#       context:                                 # transform/inject: files to read
-#         - IDENTITY.md
-#       prompt: "instruction"                    # transform: what to do with the input
-#       model: haiku | sonnet                    # transform: model for claude -p
-#       classifier:                              # optional: local LLM gate
-#         model: gemma3:1b                       # ollama model
-#         prompt: "yes/no question"              # classification prompt
+#   policy "name" do
+#     on :PreToolUse, tool: "Bash", match: :git_commit
+#     gate "reason"
+#   end
+#
+#   policy "name" do
+#     on :PreToolUse, tool: "Write", match: /README\.md/, match_field: :file_path
+#     transform context: ["IDENTITY.md", "STYLE.md"],
+#       field: :content,
+#       prompt: "Rewrite in the persona's voice."
+#   end
+#
+#   policy "name" do
+#     on :UserPromptSubmit
+#     when_prompt "The prompt involves architectural decisions."
+#     inject "REVIEW_PANEL.md"
+#   end
+#
+# DSL methods:
+#
+#   on(event, tool:, match:, match_field:)
+#     event       :PreToolUse | :UserPromptSubmit
+#     tool:       regex string on tool name (PreToolUse only)
+#                 known tools: Bash, Edit, MultiEdit, Write, Read,
+#                 Glob, Grep, NotebookEdit, Task, WebFetch, WebSearch
+#     match:      :constant | "regex" | /regex/
+#                 constants: :git_commit, :git_push, :git_push_force,
+#                 :git_reset, :git_rebase, :git_checkout, :git_switch,
+#                 :git_merge, :git_stash, :git_restore
+#     match_field: :command | :file_path | :pattern | ...
+#
+#   gate(message)                               block the action
+#   transform(context:, prompt:, field:, model:) rewrite via claude -p
+#   inject(*files)                              surface context files
+#   when_prompt(condition, model:)              LLM-only plain language matching
 #
 # Hook wiring (.claude/settings.json):
 #
 #   { "hooks": { "PreToolUse": [{ "matcher": "Bash|Edit|Write",
 #     "hooks": [{ "type": "command", "command": "bin/hooker" }] }] } }
 #
-# Dependencies: Ruby stdlib only (json, yaml, open3). No gems. No API keys.
+# Dependencies: Ruby stdlib only (json, open3). No gems. No API keys.
 # Transforms use `claude -p`. Classifiers use `ollama run`.
 
 require 'json'
-require 'yaml'
 require 'open3'
 
 module Hooker
+  # -- DSL --
+
+  class PolicyBuilder
+    attr_reader :data
+
+    def initialize(name)
+      @data = { 'name' => name }
+    end
+
+    def on(event, tool: nil, match: nil, match_field: nil)
+      @data['event'] = event.to_s
+      @data['tool'] = tool if tool
+      if match
+        @data['match'] = case match
+                         when Symbol then ":#{match}"
+                         when Regexp then match.source
+                         else match.to_s
+                         end
+      end
+      @data['match_field'] = match_field.to_s if match_field
+    end
+
+    def gate(message = nil)
+      @data['type'] = 'gate'
+      @data['message'] = message if message
+    end
+
+    def transform(context: nil, prompt: nil, field: nil, model: nil)
+      @data['type'] = 'transform'
+      @data['context'] = Array(context) if context
+      @data['prompt'] = prompt if prompt
+      @data['transform_field'] = field.to_s if field
+      @data['model'] = model if model
+    end
+
+    def inject(*files)
+      @data['type'] = 'inject'
+      @data['context'] = files.flatten
+    end
+
+    def when_prompt(condition, model: nil)
+      @data['when'] = condition
+      @data['when_model'] = model if model
+    end
+  end
+
   # Predefined match constants. Use `:name` in the match field to reference.
   # These handle tool-generated command variations (e.g. `git -C /path commit`
   # instead of `git commit`) so policy authors don't need to know the details.
@@ -128,7 +175,7 @@ module Hooker
   def find_project_root(cwd)
     dir = File.expand_path(cwd)
     loop do
-      return dir if File.exist?(File.join(dir, '.claude', 'policies.yaml'))
+      return dir if File.exist?(File.join(dir, '.claude', 'policies.rb'))
       parent = File.dirname(dir)
       return nil if parent == dir
       dir = parent
@@ -137,12 +184,19 @@ module Hooker
 
   def load_policies(project_root)
     return [] if project_root.nil?
-    path = File.join(project_root, '.claude', 'policies.yaml')
+    path = File.join(project_root, '.claude', 'policies.rb')
     return [] unless File.exist?(path)
-    data = YAML.safe_load(File.read(path))
-    return [] unless data.is_a?(Hash) && data['policies'].is_a?(Array)
-    data['policies']
-  rescue => e
+
+    policies = []
+    sandbox = Object.new
+    sandbox.define_singleton_method(:policy) do |name, &block|
+      builder = PolicyBuilder.new(name)
+      builder.instance_eval(&block)
+      policies << builder.data
+    end
+    sandbox.instance_eval(File.read(path), path)
+    policies
+  rescue SyntaxError, StandardError => e
     $stderr.puts "hooker: failed to load policies: #{e.message}"
     []
   end
@@ -195,7 +249,7 @@ module Hooker
 
   def find_matching_policies(policies, event)
     matched = policies.select { |p| policy_matches?(p, event) }
-    matched = matched.select { |p| classify?(p['classifier'], event) }
+    matched = matched.select { |p| classify?(resolve_classifier(p), event) }
     {
       gates:      matched.select { |p| p['type'] == 'gate' },
       transforms: matched.select { |p| p['type'] == 'transform' },
@@ -270,6 +324,19 @@ module Hooker
   rescue => e
     $stderr.puts "hooker: ollama failed: #{e.message}"
     nil
+  end
+
+  def resolve_classifier(policy)
+    return policy['classifier'] if policy['classifier']
+    return nil unless policy['when']
+
+    {
+      'model' => policy['when_model'] || 'gemma3:1b',
+      'prompt' => "You are a classifier. Respond with exactly \"yes\" if " \
+                  "the following condition applies to the input. Otherwise " \
+                  "respond \"no\". Output only \"yes\" or \"no\".\n\n" \
+                  "Condition: #{policy['when']}"
+    }
   end
 
   def classify?(classifier, event)

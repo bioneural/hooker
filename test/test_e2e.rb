@@ -11,13 +11,12 @@
 # PATH-prepended shim scripts. Live tests against real binaries are
 # opt-in via the HOOKER_E2E_LIVE environment variable.
 #
-# Each test creates a temporary project directory with .claude/policies.yaml,
+# Each test creates a temporary project directory with .claude/policies.rb,
 # pipes JSON to bin/hooker via Open3, and asserts on stdout / stderr / exit code.
 #
-# Dependencies: Ruby stdlib only (json, yaml, tmpdir, open3, fileutils).
+# Dependencies: Ruby stdlib only (json, tmpdir, open3, fileutils).
 
 require 'json'
-require 'yaml'
 require 'tmpdir'
 require 'open3'
 require 'fileutils'
@@ -45,11 +44,11 @@ def skip(label, reason)
   puts "  SKIP  #{label} (#{reason})"
 end
 
-def run_hooker(input_hash, policies_yaml:, context_files: {}, env: {})
+def run_hooker(input_hash, policies_rb:, context_files: {}, env: {})
   Dir.mktmpdir('hooker-e2e') do |tmpdir|
     claude_dir = File.join(tmpdir, '.claude')
     FileUtils.mkdir_p(claude_dir)
-    File.write(File.join(claude_dir, 'policies.yaml'), policies_yaml)
+    File.write(File.join(claude_dir, 'policies.rb'), policies_rb)
 
     context_files.each do |rel_path, content|
       abs = File.join(tmpdir, rel_path)
@@ -86,15 +85,12 @@ end
 
 def test_transform_with_shim
   puts "\ntransform: rewrite via claude shim"
-  policies = <<~'YAML'
-    policies:
-      - name: rewrite commits
-        event: PreToolUse
-        tool: Bash
-        match: "git commit"
-        type: transform
-        prompt: "Rewrite in persona voice."
-  YAML
+  policies = <<~'RUBY'
+    policy "Rewrite commits" do
+      on :PreToolUse, tool: "Bash", match: "git commit"
+      transform prompt: "Rewrite in persona voice."
+    end
+  RUBY
   input = { hook_event_name: 'PreToolUse', tool_name: 'Bash',
             tool_input: { command: 'git commit -m "fix bug"' } }
 
@@ -104,7 +100,7 @@ def test_transform_with_shim
   SH
 
   with_shims('claude' => claude_shim) do |path|
-    result = run_hooker(input, policies_yaml: policies, env: { 'PATH' => path })
+    result = run_hooker(input, policies_rb: policies, env: { 'PATH' => path })
     output = parse_output(result)
 
     assert 'has updatedInput', output&.dig('hookSpecificOutput', 'updatedInput').is_a?(Hash)
@@ -116,17 +112,13 @@ end
 
 def test_transform_with_context
   puts "\ntransform: context files included in prompt"
-  policies = <<~'YAML'
-    policies:
-      - name: persona commits
-        event: PreToolUse
-        tool: Bash
-        match: "git commit"
-        type: transform
-        context:
-          - IDENTITY.md
+  policies = <<~'RUBY'
+    policy "Persona commits" do
+      on :PreToolUse, tool: "Bash", match: "git commit"
+      transform context: "IDENTITY.md",
         prompt: "Rewrite in persona voice."
-  YAML
+    end
+  RUBY
   input = { hook_event_name: 'PreToolUse', tool_name: 'Bash',
             tool_input: { command: 'git commit -m "fix bug"' } }
 
@@ -143,7 +135,7 @@ def test_transform_with_context
   SH
 
   with_shims('claude' => claude_shim) do |path|
-    result = run_hooker(input, policies_yaml: policies,
+    result = run_hooker(input, policies_rb: policies,
                         env: { 'PATH' => path },
                         context_files: { 'IDENTITY.md' => 'I am Vetra.' })
     output = parse_output(result)
@@ -156,21 +148,17 @@ end
 
 def test_multiple_transforms_accumulated
   puts "\ntransform: multiple transforms accumulated into one call"
-  policies = <<~'YAML'
-    policies:
-      - name: transform A
-        event: PreToolUse
-        tool: Bash
-        match: "git commit"
-        type: transform
-        prompt: "Add emoji prefix."
-      - name: transform B
-        event: PreToolUse
-        tool: Bash
-        match: "git commit"
-        type: transform
-        prompt: "Make it lowercase."
-  YAML
+  policies = <<~'RUBY'
+    policy "Transform A" do
+      on :PreToolUse, tool: "Bash", match: "git commit"
+      transform prompt: "Add emoji prefix."
+    end
+
+    policy "Transform B" do
+      on :PreToolUse, tool: "Bash", match: "git commit"
+      transform prompt: "Make it lowercase."
+    end
+  RUBY
   input = { hook_event_name: 'PreToolUse', tool_name: 'Bash',
             tool_input: { command: 'git commit -m "Fix Bug"' } }
 
@@ -186,7 +174,7 @@ def test_multiple_transforms_accumulated
   SH
 
   with_shims('claude' => claude_shim) do |path|
-    result = run_hooker(input, policies_yaml: policies, env: { 'PATH' => path })
+    result = run_hooker(input, policies_rb: policies, env: { 'PATH' => path })
     output = parse_output(result)
 
     assert 'has updatedInput', output&.dig('hookSpecificOutput', 'updatedInput').is_a?(Hash)
@@ -198,19 +186,14 @@ end
 
 def test_transform_write_with_transform_field
   puts "\ntransform: Write transform uses transform_field to target content"
-  policies = <<~'YAML'
-    policies:
-      - name: readme voice
-        event: PreToolUse
-        tool: Write
-        match_field: file_path
-        match: "README\\.md"
-        transform_field: content
-        type: transform
-        context:
-          - IDENTITY.md
+  policies = <<~'RUBY'
+    policy "README voice" do
+      on :PreToolUse, tool: "Write", match: 'README\.md', match_field: :file_path
+      transform context: "IDENTITY.md",
+        field: :content,
         prompt: "Rewrite in persona voice."
-  YAML
+    end
+  RUBY
   input = { hook_event_name: 'PreToolUse', tool_name: 'Write',
             tool_input: { file_path: '/app/README.md', content: 'A cool project for everyone.' } }
 
@@ -226,7 +209,7 @@ def test_transform_write_with_transform_field
   SH
 
   with_shims('claude' => claude_shim) do |path|
-    result = run_hooker(input, policies_yaml: policies,
+    result = run_hooker(input, policies_rb: policies,
                         env: { 'PATH' => path },
                         context_files: { 'IDENTITY.md' => 'I am Vetra.' })
     output = parse_output(result)
@@ -241,20 +224,17 @@ end
 
 def test_transform_failopen_claude_missing
   puts "\ntransform: fail-open when claude not in PATH"
-  policies = <<~'YAML'
-    policies:
-      - name: rewrite commits
-        event: PreToolUse
-        tool: Bash
-        match: "git commit"
-        type: transform
-        prompt: "Rewrite."
-  YAML
+  policies = <<~'RUBY'
+    policy "Rewrite commits" do
+      on :PreToolUse, tool: "Bash", match: "git commit"
+      transform prompt: "Rewrite."
+    end
+  RUBY
   input = { hook_event_name: 'PreToolUse', tool_name: 'Bash',
             tool_input: { command: 'git commit -m "fix"' } }
 
   # Minimal PATH — no claude binary available
-  result = run_hooker(input, policies_yaml: policies, env: { 'PATH' => '/usr/bin:/bin' })
+  result = run_hooker(input, policies_rb: policies, env: { 'PATH' => '/usr/bin:/bin' })
 
   assert 'exit 0 (fail-open)', result[:exit_code] == 0
   assert 'no updatedInput (graceful failure)', result[:stdout].strip.empty?
@@ -264,17 +244,13 @@ end
 
 def test_classifier_yes
   puts "\nclassifier: ollama returns yes, inject fires"
-  policies = <<~'YAML'
-    policies:
-      - name: panel review
-        event: UserPromptSubmit
-        type: inject
-        classifier:
-          model: gemma3:1b
-          prompt: "Does this warrant review? yes or no."
-        context:
-          - REVIEW_PANEL.md
-  YAML
+  policies = <<~'RUBY'
+    policy "Panel review" do
+      on :UserPromptSubmit
+      when_prompt "The input discusses architectural decisions or system design."
+      inject "REVIEW_PANEL.md"
+    end
+  RUBY
   input = { hook_event_name: 'UserPromptSubmit', prompt: 'redesign the auth system' }
 
   ollama_shim = <<~SH
@@ -283,7 +259,7 @@ def test_classifier_yes
   SH
 
   with_shims('ollama' => ollama_shim) do |path|
-    result = run_hooker(input, policies_yaml: policies,
+    result = run_hooker(input, policies_rb: policies,
                         env: { 'PATH' => path },
                         context_files: { 'REVIEW_PANEL.md' => 'Panel: Alice, Bob, Carol' })
     output = parse_output(result)
@@ -296,17 +272,13 @@ end
 
 def test_classifier_no
   puts "\nclassifier: ollama returns no, inject suppressed"
-  policies = <<~'YAML'
-    policies:
-      - name: panel review
-        event: UserPromptSubmit
-        type: inject
-        classifier:
-          model: gemma3:1b
-          prompt: "Does this warrant review? yes or no."
-        context:
-          - REVIEW_PANEL.md
-  YAML
+  policies = <<~'RUBY'
+    policy "Panel review" do
+      on :UserPromptSubmit
+      when_prompt "The input discusses architectural decisions or system design."
+      inject "REVIEW_PANEL.md"
+    end
+  RUBY
   input = { hook_event_name: 'UserPromptSubmit', prompt: 'fix typo' }
 
   ollama_shim = <<~SH
@@ -315,7 +287,7 @@ def test_classifier_no
   SH
 
   with_shims('ollama' => ollama_shim) do |path|
-    result = run_hooker(input, policies_yaml: policies,
+    result = run_hooker(input, policies_rb: policies,
                         env: { 'PATH' => path },
                         context_files: { 'REVIEW_PANEL.md' => 'Panel: Alice, Bob, Carol' })
 
@@ -325,21 +297,17 @@ end
 
 def test_classifier_failopen_ollama_missing
   puts "\nclassifier: fail-open when ollama not in PATH"
-  policies = <<~'YAML'
-    policies:
-      - name: panel review
-        event: UserPromptSubmit
-        type: inject
-        classifier:
-          model: gemma3:1b
-          prompt: "Does this warrant review?"
-        context:
-          - REVIEW_PANEL.md
-  YAML
+  policies = <<~'RUBY'
+    policy "Panel review" do
+      on :UserPromptSubmit
+      when_prompt "The input discusses architectural decisions or system design."
+      inject "REVIEW_PANEL.md"
+    end
+  RUBY
   input = { hook_event_name: 'UserPromptSubmit', prompt: 'redesign auth' }
 
   # Minimal PATH — no ollama binary available
-  result = run_hooker(input, policies_yaml: policies,
+  result = run_hooker(input, policies_rb: policies,
                       env: { 'PATH' => '/usr/bin:/bin' },
                       context_files: { 'REVIEW_PANEL.md' => 'Panel members' })
 
@@ -348,19 +316,14 @@ def test_classifier_failopen_ollama_missing
 end
 
 def test_classifier_on_gate
-  puts "\nclassifier: gate with classifier yes still denies"
-  policies = <<~'YAML'
-    policies:
-      - name: smart gate
-        event: PreToolUse
-        tool: Bash
-        match: "deploy"
-        type: gate
-        message: "Deploy blocked by classifier."
-        classifier:
-          model: gemma3:1b
-          prompt: "Is this a production deploy? yes or no."
-  YAML
+  puts "\nclassifier: gate with when_prompt yes still denies"
+  policies = <<~'RUBY'
+    policy "Smart gate" do
+      on :PreToolUse, tool: "Bash", match: "deploy"
+      when_prompt "The input is a production deploy."
+      gate "Deploy blocked by classifier."
+    end
+  RUBY
   input = { hook_event_name: 'PreToolUse', tool_name: 'Bash',
             tool_input: { command: 'deploy --production' } }
 
@@ -370,12 +333,101 @@ def test_classifier_on_gate
   SH
 
   with_shims('ollama' => ollama_shim) do |path|
-    result = run_hooker(input, policies_yaml: policies, env: { 'PATH' => path })
+    result = run_hooker(input, policies_rb: policies, env: { 'PATH' => path })
     output = parse_output(result)
 
     assert 'gate fires with classifier yes',
       output&.dig('hookSpecificOutput', 'permissionDecision') == 'deny'
   end
+end
+
+# -- when_prompt Tests (shimmed) --
+
+def test_when_prompt_generates_classifier_prompt
+  puts "\nwhen_prompt: auto-generates classifier prompt with condition"
+  policies = <<~'RUBY'
+    policy "Architectural review" do
+      on :UserPromptSubmit
+      when_prompt "The prompt involves architectural decisions."
+      inject "REVIEW_PANEL.md"
+    end
+  RUBY
+  input = { hook_event_name: 'UserPromptSubmit', prompt: 'redesign the database schema' }
+
+  # Shim captures the prompt sent to ollama and checks it contains the condition
+  ollama_shim = <<~SH
+    #!/bin/sh
+    INPUT=$(cat)
+    if echo "$INPUT" | grep -q "architectural decisions"; then
+      echo "yes"
+    else
+      echo "no"
+    fi
+  SH
+
+  with_shims('ollama' => ollama_shim) do |path|
+    result = run_hooker(input, policies_rb: policies,
+                        env: { 'PATH' => path },
+                        context_files: { 'REVIEW_PANEL.md' => 'Panel content here' })
+    output = parse_output(result)
+
+    assert 'when_prompt condition passed to ollama',
+      output&.dig('hookSpecificOutput', 'additionalContext')&.include?('Panel content here')
+  end
+end
+
+def test_when_prompt_with_custom_model
+  puts "\nwhen_prompt: custom model passed to ollama"
+  policies = <<~'RUBY'
+    policy "Custom model review" do
+      on :UserPromptSubmit
+      when_prompt "The prompt involves security concerns.", model: "llama3:8b"
+      inject "SECURITY.md"
+    end
+  RUBY
+  input = { hook_event_name: 'UserPromptSubmit', prompt: 'audit the auth system' }
+
+  # Shim checks the model argument
+  ollama_shim = <<~SH
+    #!/bin/sh
+    if [ "$2" = "llama3:8b" ]; then
+      echo "yes"
+    else
+      echo "WRONG_MODEL: got $2" >&2
+      echo "no"
+    fi
+  SH
+
+  with_shims('ollama' => ollama_shim) do |path|
+    result = run_hooker(input, policies_rb: policies,
+                        env: { 'PATH' => path },
+                        context_files: { 'SECURITY.md' => 'Security guidelines' })
+    output = parse_output(result)
+
+    assert 'custom model used', !result[:stderr].include?('WRONG_MODEL')
+    assert 'inject fired with custom model',
+      output&.dig('hookSpecificOutput', 'additionalContext')&.include?('Security guidelines')
+  end
+end
+
+def test_when_prompt_no_fires_without_classifier
+  puts "\nwhen_prompt: policy without when_prompt skips classifier"
+  policies = <<~'RUBY'
+    policy "Always inject" do
+      on :UserPromptSubmit
+      inject "PANEL.md"
+    end
+  RUBY
+  input = { hook_event_name: 'UserPromptSubmit', prompt: 'fix typo' }
+
+  # No ollama shim needed — classifier should be skipped entirely
+  result = run_hooker(input, policies_rb: policies,
+                      env: { 'PATH' => '/usr/bin:/bin' },
+                      context_files: { 'PANEL.md' => 'Panel content' })
+  output = parse_output(result)
+
+  assert 'inject fires without classifier (no ollama needed)',
+    output&.dig('hookSpecificOutput', 'additionalContext')&.include?('Panel content')
 end
 
 # -- Live Tests (opt-in) --
@@ -387,7 +439,7 @@ HAVE_CLAUDE = system('which claude > /dev/null 2>&1')
 HAVE_OLLAMA = system('which ollama > /dev/null 2>&1')
 LIVE = ENV['HOOKER_E2E_LIVE']
 
-def setup_live_repo(policies_yaml:, context_files: {})
+def setup_live_repo(policies_rb:, context_files: {})
   tmpdir = Dir.mktmpdir('hooker-live')
 
   # Init git repo
@@ -398,7 +450,7 @@ def setup_live_repo(policies_yaml:, context_files: {})
   # Write policies
   claude_dir = File.join(tmpdir, '.claude')
   FileUtils.mkdir_p(claude_dir)
-  File.write(File.join(claude_dir, 'policies.yaml'), policies_yaml)
+  File.write(File.join(claude_dir, 'policies.rb'), policies_rb)
 
   # Write context files
   context_files.each do |rel_path, content|
@@ -425,17 +477,14 @@ def test_live_gate_deny
     return skip('live gate deny', 'requires HOOKER_E2E_LIVE=1')
   end
 
-  policies = <<~'YAML'
-    policies:
-      - name: no force push
-        event: PreToolUse
-        tool: Bash
-        match: "push.*--force"
-        type: gate
-        message: "Force push is not allowed."
-  YAML
+  policies = <<~'RUBY'
+    policy "No force push" do
+      on :PreToolUse, tool: "Bash", match: "push.*--force"
+      gate "Force push is not allowed."
+    end
+  RUBY
 
-  tmpdir = setup_live_repo(policies_yaml: policies)
+  tmpdir = setup_live_repo(policies_rb: policies)
   input = {
     hook_event_name: 'PreToolUse',
     tool_name: 'Bash',
@@ -458,17 +507,14 @@ def test_live_gate_allow
     return skip('live gate allow', 'requires HOOKER_E2E_LIVE=1')
   end
 
-  policies = <<~'YAML'
-    policies:
-      - name: no force push
-        event: PreToolUse
-        tool: Bash
-        match: "push.*--force"
-        type: gate
-        message: "Force push is not allowed."
-  YAML
+  policies = <<~'RUBY'
+    policy "No force push" do
+      on :PreToolUse, tool: "Bash", match: "push.*--force"
+      gate "Force push is not allowed."
+    end
+  RUBY
 
-  tmpdir = setup_live_repo(policies_yaml: policies)
+  tmpdir = setup_live_repo(policies_rb: policies)
   input = {
     hook_event_name: 'PreToolUse',
     tool_name: 'Bash',
@@ -490,26 +536,20 @@ def test_live_transform_commit
     return skip('live transform', 'requires claude CLI and HOOKER_E2E_LIVE=1')
   end
 
-  policies = <<~'YAML'
-    policies:
-      - name: persona commits
-        event: PreToolUse
-        tool: Bash
-        match: "git commit"
-        type: transform
-        context:
-          - IDENTITY.md
-        prompt: >
-          Rewrite this commit message so it begins with the word "structural".
-          Keep the rest of the technical content. Return only the complete
-          git commit command.
-  YAML
+  policies = <<~'RUBY'
+    policy "Persona commits" do
+      on :PreToolUse, tool: "Bash", match: "git commit"
+      transform context: "IDENTITY.md",
+        prompt: "Rewrite this commit message so it begins with the word \"structural\". " \
+                "Keep the rest of the technical content. Return only the complete git commit command."
+    end
+  RUBY
 
   identity = <<~'MD'
     You are a precise, measured intelligence. Every word is deliberate.
   MD
 
-  tmpdir = setup_live_repo(policies_yaml: policies, context_files: { 'IDENTITY.md' => identity })
+  tmpdir = setup_live_repo(policies_rb: policies, context_files: { 'IDENTITY.md' => identity })
   input = {
     hook_event_name: 'PreToolUse',
     tool_name: 'Bash',
@@ -538,28 +578,21 @@ def test_live_transform_readme
     return skip('live transform readme', 'requires claude CLI and HOOKER_E2E_LIVE=1')
   end
 
-  policies = <<~'YAML'
-    policies:
-      - name: readme voice
-        event: PreToolUse
-        tool: Write
-        match_field: file_path
-        match: "README\\.md"
-        transform_field: content
-        type: transform
-        context:
-          - IDENTITY.md
-        prompt: >
-          Rewrite this file content so the first sentence begins with
-          "This system". Preserve all technical content. Return only the
-          file content.
-  YAML
+  policies = <<~'RUBY'
+    policy "README voice" do
+      on :PreToolUse, tool: "Write", match: 'README\.md', match_field: :file_path
+      transform context: "IDENTITY.md",
+        field: :content,
+        prompt: "Rewrite this file content so the first sentence begins with " \
+                "\"This system\". Preserve all technical content. Return only the file content."
+    end
+  RUBY
 
   identity = <<~'MD'
     You are a precise, measured intelligence. Every word is deliberate.
   MD
 
-  tmpdir = setup_live_repo(policies_yaml: policies, context_files: { 'IDENTITY.md' => identity })
+  tmpdir = setup_live_repo(policies_rb: policies, context_files: { 'IDENTITY.md' => identity })
   original_path = "#{tmpdir}/README.md"
   input = {
     hook_event_name: 'PreToolUse',
@@ -589,18 +622,14 @@ def test_live_env_gate
     return skip('live env gate', 'requires HOOKER_E2E_LIVE=1')
   end
 
-  policies = <<~'YAML'
-    policies:
-      - name: no env edits
-        event: PreToolUse
-        tool: Edit|Write
-        match_field: file_path
-        match: "\\.env"
-        type: gate
-        message: "Modifying .env files is prohibited."
-  YAML
+  policies = <<~'RUBY'
+    policy "No env edits" do
+      on :PreToolUse, tool: "Edit|Write", match: '\.env', match_field: :file_path
+      gate "Modifying .env files is prohibited."
+    end
+  RUBY
 
-  tmpdir = setup_live_repo(policies_yaml: policies)
+  tmpdir = setup_live_repo(policies_rb: policies)
   input = {
     hook_event_name: 'PreToolUse',
     tool_name: 'Write',
@@ -623,20 +652,13 @@ def test_live_classifier_yes
     return skip('live classifier yes', 'requires ollama and HOOKER_E2E_LIVE=1')
   end
 
-  policies = <<~'YAML'
-    policies:
-      - name: panel escalation
-        event: UserPromptSubmit
-        type: inject
-        classifier:
-          model: gemma3:1b
-          prompt: >
-            You are a classifier. Respond with exactly "yes" if the input
-            discusses architectural decisions or system design. Otherwise
-            respond "no". Output only "yes" or "no".
-        context:
-          - REVIEW_PANEL.md
-  YAML
+  policies = <<~'RUBY'
+    policy "Panel escalation" do
+      on :UserPromptSubmit
+      when_prompt "The input discusses architectural decisions or system design."
+      inject "REVIEW_PANEL.md"
+    end
+  RUBY
 
   panel = <<~'MD'
     ## Review Panel
@@ -645,7 +667,7 @@ def test_live_classifier_yes
     - Sadie Okafor: prompt engineering
   MD
 
-  tmpdir = setup_live_repo(policies_yaml: policies, context_files: { 'REVIEW_PANEL.md' => panel })
+  tmpdir = setup_live_repo(policies_rb: policies, context_files: { 'REVIEW_PANEL.md' => panel })
   input = {
     hook_event_name: 'UserPromptSubmit',
     prompt: 'We need to redesign the entire authentication architecture from scratch. This is a major system design decision.',
@@ -671,22 +693,15 @@ def test_live_classifier_no
     return skip('live classifier no', 'requires ollama and HOOKER_E2E_LIVE=1')
   end
 
-  policies = <<~'YAML'
-    policies:
-      - name: panel escalation
-        event: UserPromptSubmit
-        type: inject
-        classifier:
-          model: gemma3:1b
-          prompt: >
-            You are a classifier. Respond with exactly "yes" if the input
-            discusses architectural decisions or system design. Otherwise
-            respond "no". Output only "yes" or "no".
-        context:
-          - REVIEW_PANEL.md
-  YAML
+  policies = <<~'RUBY'
+    policy "Panel escalation" do
+      on :UserPromptSubmit
+      when_prompt "The input discusses architectural decisions or system design."
+      inject "REVIEW_PANEL.md"
+    end
+  RUBY
 
-  tmpdir = setup_live_repo(policies_yaml: policies,
+  tmpdir = setup_live_repo(policies_rb: policies,
                            context_files: { 'REVIEW_PANEL.md' => 'Panel members' })
   input = {
     hook_event_name: 'UserPromptSubmit',
@@ -709,17 +724,14 @@ def test_live_no_matching_policy
     return skip('live no match', 'requires HOOKER_E2E_LIVE=1')
   end
 
-  policies = <<~'YAML'
-    policies:
-      - name: no force push
-        event: PreToolUse
-        tool: Bash
-        match: "push.*--force"
-        type: gate
-        message: "Force push is not allowed."
-  YAML
+  policies = <<~'RUBY'
+    policy "No force push" do
+      on :PreToolUse, tool: "Bash", match: "push.*--force"
+      gate "Force push is not allowed."
+    end
+  RUBY
 
-  tmpdir = setup_live_repo(policies_yaml: policies)
+  tmpdir = setup_live_repo(policies_rb: policies)
   input = {
     hook_event_name: 'PreToolUse',
     tool_name: 'Bash',
@@ -753,6 +765,11 @@ def run_tests
   test_classifier_no
   test_classifier_failopen_ollama_missing
   test_classifier_on_gate
+
+  # Shimmed when_prompt
+  test_when_prompt_generates_classifier_prompt
+  test_when_prompt_with_custom_model
+  test_when_prompt_no_fires_without_classifier
 
   # Live (opt-in) — real git repos, real claude -p, real ollama
   test_live_gate_deny
