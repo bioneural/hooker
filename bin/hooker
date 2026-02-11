@@ -43,6 +43,11 @@
 #     inject "REVIEW_PANEL.md"
 #   end
 #
+#   policy "name" do
+#     on :UserPromptSubmit
+#     inject command: "bin/my-command"   # stdout becomes context
+#   end
+#
 # DSL methods:
 #
 #   on(event, tool:, match:, match_field:)
@@ -58,7 +63,7 @@
 #
 #   gate(message)                               block the action
 #   transform(context:, prompt:, field:, model:) rewrite via claude -p
-#   inject(*files)                              surface context files
+#   inject(*files, command:)                     surface context files or command output
 #   when_prompt(condition, model:)              LLM-only plain language matching
 #
 # Hook wiring (.claude/settings.json):
@@ -108,9 +113,10 @@ module Hooker
       @data['model'] = model if model
     end
 
-    def inject(*files)
+    def inject(*files, command: nil)
       @data['type'] = 'inject'
-      @data['context'] = files.flatten
+      @data['context'] = files.flatten unless files.empty?
+      @data['context_command'] = command if command
     end
 
     def when_prompt(condition, model: nil)
@@ -262,7 +268,7 @@ module Hooker
   def read_context_files(paths, project_root)
     parts = []
     paths.each do |rel_path|
-      abs_path = File.join(project_root, rel_path)
+      abs_path = rel_path.start_with?('/') ? rel_path : File.join(project_root, rel_path)
       unless File.exist?(abs_path)
         $stderr.puts "hooker: context file not found: #{abs_path}"
         next
@@ -376,10 +382,43 @@ module Hooker
     updated
   end
 
-  def execute_injects(injects, project_root)
+  def run_context_command(command, project_root, stdin_data = nil)
+    stdout, stderr, status = Open3.capture3(
+      command,
+      chdir: project_root,
+      stdin_data: stdin_data || ''
+    )
+    unless status.success?
+      $stderr.puts "hooker: context_command failed: #{stderr.strip}" unless stderr.strip.empty?
+      return nil
+    end
+    result = stdout.strip
+    result.empty? ? nil : result
+  rescue Errno::ENOENT
+    $stderr.puts "hooker: context_command not found: #{command}"
+    nil
+  rescue => e
+    $stderr.puts "hooker: context_command error: #{e.message}"
+    nil
+  end
+
+  def execute_injects(injects, event, project_root)
+    parts = []
+
+    # File context
     all_paths = injects.flat_map { |p| p['context'] || [] }.uniq
-    context = read_context_files(all_paths, project_root)
-    context.empty? ? nil : context
+    file_context = read_context_files(all_paths, project_root)
+    parts << file_context unless file_context.empty?
+
+    # Command context
+    stdin_data = event['prompt'] || event.dig('tool_input', 'command') || ''
+    injects.each do |p|
+      next unless p['context_command']
+      result = run_context_command(p['context_command'], project_root, stdin_data)
+      parts << result if result
+    end
+
+    parts.empty? ? nil : parts.join("\n\n")
   end
 
   # -- Output --
@@ -449,7 +488,7 @@ module Hooker
 
     # Injects: all matches accumulated
     unless matched[:injects].empty?
-      context = execute_injects(matched[:injects], project_root)
+      context = execute_injects(matched[:injects], event, project_root)
       if context
         output_additional_context(event_name, context)
         exit 0
