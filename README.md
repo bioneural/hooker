@@ -95,7 +95,11 @@ A syntax error in one file skips that file. Other levels still evaluate.
 
 ## Examples
 
-Block edits to sensitive files:
+Each example shows the policy, what hooker receives, and what it outputs.
+
+### Gate — block an action
+
+Policy:
 
 ```ruby
 policy "No env edits" do
@@ -104,7 +108,37 @@ policy "No env edits" do
 end
 ```
 
-Rewrite commit messages to follow a project convention:
+Input (from Claude Code via stdin):
+
+```json
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Write",
+  "tool_input": {
+    "file_path": "/app/.env",
+    "content": "API_KEY=secret"
+  },
+  "cwd": "/app"
+}
+```
+
+Output (stdout):
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "deny",
+    "permissionDecisionReason": "Modifying .env files is prohibited."
+  }
+}
+```
+
+The action is blocked. Claude Code sees the denial reason and does not execute the tool call.
+
+### Transform — rewrite an action
+
+Policy:
 
 ```ruby
 policy "Conventional commits" do
@@ -116,7 +150,59 @@ policy "Conventional commits" do
 end
 ```
 
-Enforce a license header on new Python files (`field:` targets `content` while matching on `file_path`):
+Input:
+
+```json
+{
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "git commit -m \"fix auth bug\""
+  },
+  "cwd": "/app"
+}
+```
+
+hooker reads `COMMIT_STYLE.md` from the project root and assembles this prompt for `claude -p`:
+
+```
+<context>
+<COMMIT_STYLE.md>
+Use conventional commits: type(scope): description
+Types: feat, fix, refactor, docs, test, chore
+</COMMIT_STYLE.md>
+</context>
+
+<current_input>
+{
+  "command": "git commit -m \"fix auth bug\""
+}
+</current_input>
+
+<instructions>
+Rewrite this commit message to follow the conventions in COMMIT_STYLE.md.
+Preserve technical content. Return only the complete git commit command.
+</instructions>
+
+Return ONLY the transformed value. No explanation, no markdown fencing.
+```
+
+The model responds with the rewritten command. hooker outputs:
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "updatedInput": {
+      "command": "git commit -m \"fix(auth): resolve authentication bug\""
+    }
+  }
+}
+```
+
+Claude Code executes the rewritten command instead of the original. The agent never sees the transform logic — zero token pollution.
+
+**`field:` override.** When matching on one field but rewriting another, use `field:` to specify the target:
 
 ```ruby
 policy "License header" do
@@ -128,9 +214,11 @@ policy "License header" do
 end
 ```
 
-`field: :content` is critical here — the policy matches on `file_path` to detect `.py` files, but the transform must write to `content`. Without it, the rewritten content would overwrite the file path.
+This matches on `file_path` (to detect `.py` files) but writes the model's response to `content`. Without `field: :content`, the rewritten value would overwrite `file_path`.
 
-Surface a review panel for architectural decisions, gated by a plain-language classifier:
+### Inject — surface context
+
+Policy:
 
 ```ruby
 policy "Escalate to review panel when the prompt warrants it" do
@@ -141,6 +229,40 @@ policy "Escalate to review panel when the prompt warrants it" do
   inject "REVIEW_PANEL.md"
 end
 ```
+
+Input:
+
+```json
+{
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "We need to redesign the authentication system from scratch.",
+  "cwd": "/app"
+}
+```
+
+hooker sends the prompt to `ollama run gemma3:1b` with a yes/no classifier. The model responds "yes" — the condition matches. hooker reads `REVIEW_PANEL.md` and outputs:
+
+```json
+{
+  "hookSpecificOutput": {
+    "hookEventName": "UserPromptSubmit",
+    "additionalContext": "<REVIEW_PANEL.md>\n## Review Panel\n- Alice: security\n- Bob: architecture\n- Carol: UX\n</REVIEW_PANEL.md>"
+  }
+}
+```
+
+Claude Code injects this context into the agent's prompt before it reasons. The information is present because the system placed it there, not because the agent chose to retrieve it.
+
+**`command:` injection.** Instead of reading a file, run a command and inject its stdout:
+
+```ruby
+policy "Inject git context" do
+  on :UserPromptSubmit
+  inject command: "git log --oneline -10"
+end
+```
+
+The command runs with the policy's root directory as its working directory. The user's prompt is piped to the command's stdin.
 
 ## Architecture
 
@@ -303,11 +425,13 @@ Return ONLY the transformed value. No explanation, no markdown fencing.
 
 The model's response replaces the value of the target field (`field:`, or the default match field). Write your `prompt:` knowing that the model can reference context files by their `<filename>` tags and can see the full tool input JSON.
 
-### `inject(*files)`
+### `inject(*files, command:)`
 
-Surfaces context files to the agent before it reasons.
+Surfaces context to the agent before it reasons.
 
 **`files`** — One or more file paths (relative to the policy file's root directory) to read and return as additional context. Files are wrapped in `<filename>` tags. Multiple matching injects have their context files merged and deduplicated.
+
+**`command:`** — A shell command whose stdout becomes additional context. The command runs with the policy's root directory as its working directory. The user's prompt (or tool input command) is piped to stdin. Fails open — if the command exits non-zero or is not found, the inject is skipped.
 
 ### `when_prompt(condition, model:)`
 
