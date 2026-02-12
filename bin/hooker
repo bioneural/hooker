@@ -76,6 +76,40 @@
 
 require 'json'
 require 'open3'
+require 'fileutils'
+
+# -- Inline structured logging (spill protocol) --
+# hooker cannot require external files — this is the minimal inline equivalent.
+# Writes to a SQLite database at .state/spill/spill.db via sqlite3 CLI.
+SPILL_DB = ENV['SPILL_DB'] || File.join(Dir.pwd, '.state', 'spill', 'spill.db')
+@spill_db_ready = false
+
+def spill(level, msg, **ctx)
+  $stderr.puts "hooker: #{msg}"
+  unless @spill_db_ready
+    dir = File.dirname(SPILL_DB)
+    FileUtils.mkdir_p(dir) unless File.directory?(dir)
+    Open3.capture2('sqlite3', SPILL_DB, stdin_data: <<~SQL, err: File::NULL)
+      PRAGMA busy_timeout = 5000;
+      PRAGMA journal_mode = WAL;
+      CREATE TABLE IF NOT EXISTS log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
+        tool TEXT NOT NULL, level TEXT NOT NULL, msg TEXT NOT NULL,
+        pid INTEGER NOT NULL, ctx TEXT
+      );
+    SQL
+    @spill_db_ready = true
+  end
+  ts = Time.now.utc.strftime('%Y-%m-%dT%H:%M:%S.%3NZ')
+  escaped = msg.gsub("'", "''")
+  ctx_sql = ctx.empty? ? 'NULL' : "'#{JSON.generate(ctx).gsub("'", "''")}'"
+  Open3.capture2('sqlite3', SPILL_DB, stdin_data:
+    "PRAGMA busy_timeout = 5000; INSERT INTO log (ts,tool,level,msg,pid,ctx) " \
+    "VALUES ('#{ts}','hooker','#{level}','#{escaped}',#{Process.pid},#{ctx_sql});",
+    err: File::NULL)
+rescue
+  nil # fail-open
+end
 
 SCREEN_HOME = ENV['SCREEN_HOME'] || File.expand_path('../../screen', File.dirname(__FILE__))
 CLASSIFY_BIN = File.join(SCREEN_HOME, 'bin', 'classify')
@@ -177,7 +211,7 @@ module Hooker
   def parse_event(raw)
     JSON.parse(raw)
   rescue JSON::ParserError => e
-    $stderr.puts "hooker: invalid JSON input: #{e.message}"
+    spill('error', "invalid JSON input: #{e.message}")
     exit 0
   end
 
@@ -208,7 +242,7 @@ module Hooker
     sandbox.instance_eval(File.read(path), path)
     policies
   rescue SyntaxError, StandardError => e
-    $stderr.puts "hooker: failed to load policies: #{e.message}"
+    spill('error', "failed to load policies: #{e.message}")
     []
   end
 
@@ -229,7 +263,7 @@ module Hooker
     return raw unless raw.is_a?(String) && raw.start_with?(':')
     resolved = MATCH_CONSTANTS[raw]
     if resolved.nil?
-      $stderr.puts "hooker: unknown match constant '#{raw}'"
+      spill('error', "unknown match constant '#{raw}'")
       return nil
     end
     resolved
@@ -254,7 +288,7 @@ module Hooker
 
     true
   rescue RegexpError => e
-    $stderr.puts "hooker: invalid regex in policy '#{policy['name']}': #{e.message}"
+    spill('error', "invalid regex in policy '#{policy['name']}': #{e.message}")
     false
   end
 
@@ -275,7 +309,7 @@ module Hooker
     paths.each do |rel_path|
       abs_path = rel_path.start_with?('/') ? rel_path : File.join(project_root, rel_path)
       unless File.exist?(abs_path)
-        $stderr.puts "hooker: context file not found: #{abs_path}"
+        spill('warn', "context file not found: #{abs_path}")
         next
       end
       filename = File.basename(rel_path)
@@ -294,7 +328,7 @@ module Hooker
         next if seen[abs]
         seen[abs] = true
         unless File.exist?(abs)
-          $stderr.puts "hooker: context file not found: #{abs}"
+          spill('warn', "context file not found: #{abs}")
           next
         end
         filename = File.basename(rel_path)
@@ -324,32 +358,32 @@ module Hooker
     stdout, status = Open3.capture2(*cmd, stdin_data: prompt)
     unless status.success?
       warning = "claude -p exited with #{status.exitstatus}"
-      $stderr.puts "hooker: #{warning}"
+      spill('warn', warning)
       return [nil, warning]
     end
     result = stdout.strip
     result = result.sub(/\A```\w*\n?/, '').sub(/\n?```\z/, '').strip
     [result, nil]
   rescue Errno::ENOENT
-    $stderr.puts 'hooker: claude CLI not found'
+    spill('warn', 'claude CLI not found')
     [nil, 'claude CLI not found']
   rescue => e
-    $stderr.puts "hooker: claude -p failed: #{e.message}"
+    spill('error', "claude -p failed: #{e.message}")
     [nil, "claude -p failed: #{e.message}"]
   end
 
   def call_ollama(prompt, model = 'gemma3:1b')
     stdout, status = Open3.capture2('ollama', 'run', model, stdin_data: prompt)
     unless status.success?
-      $stderr.puts "hooker: ollama exited with #{status.exitstatus}"
+      spill('error', "ollama exited with #{status.exitstatus}")
       return nil
     end
     stdout.strip
   rescue Errno::ENOENT
-    $stderr.puts 'hooker: ollama not found'
+    spill('warn', 'ollama not found')
     nil
   rescue => e
-    $stderr.puts "hooker: ollama failed: #{e.message}"
+    spill('error', "ollama failed: #{e.message}")
     nil
   end
 
@@ -379,15 +413,15 @@ module Hooker
 
     stdout, status = Open3.capture2(CLASSIFY_BIN, stdin_data: JSON.generate(input))
     unless status.success?
-      $stderr.puts "hooker: classify exited with #{status.exitstatus}"
+      spill('error', "classify exited with #{status.exitstatus}")
       return false
     end
     stdout.strip.downcase.start_with?('yes')
   rescue Errno::ENOENT
-    $stderr.puts "hooker: classify not found at #{CLASSIFY_BIN}"
+    spill('warn', "classify not found at #{CLASSIFY_BIN}")
     false
   rescue => e
-    $stderr.puts "hooker: classification failed: #{e.message}"
+    spill('error', "classification failed: #{e.message}")
     false
   end
 
@@ -422,16 +456,16 @@ module Hooker
       stdin_data: stdin_data || ''
     )
     unless status.success?
-      $stderr.puts "hooker: context_command failed: #{stderr.strip}" unless stderr.strip.empty?
+      spill('error', "context_command failed: #{stderr.strip}") unless stderr.strip.empty?
       return nil
     end
     result = stdout.strip
     result.empty? ? nil : result
   rescue Errno::ENOENT
-    $stderr.puts "hooker: context_command not found: #{command}"
+    spill('warn', "context_command not found: #{command}")
     nil
   rescue => e
-    $stderr.puts "hooker: context_command error: #{e.message}"
+    spill('error', "context_command error: #{e.message}")
     nil
   end
 
@@ -447,7 +481,7 @@ module Hooker
         next if seen[abs]
         seen[abs] = true
         unless File.exist?(abs)
-          $stderr.puts "hooker: context file not found: #{abs}"
+          spill('warn', "context file not found: #{abs}")
           next
         end
         filename = File.basename(rel_path)
@@ -527,7 +561,7 @@ module Hooker
       ENV[key] ||= value
     end
   rescue => e
-    $stderr.puts "hooker: failed to load .env: #{e.message}"
+    spill('error', "failed to load .env: #{e.message}")
   end
 
   # -- Entry --
