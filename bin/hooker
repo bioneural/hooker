@@ -490,6 +490,8 @@ module Hooker
     unless matched[:injects].empty?
       context = execute_injects(matched[:injects], event, project_root)
       if context
+        names = matched[:injects].map { |p| p['name'] }.join(', ')
+        context = "#{context}\n\n<hooker:matched>#{names}</hooker:matched>"
         output_additional_context(event_name, context)
         exit 0
       end
