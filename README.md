@@ -14,7 +14,7 @@ Prompts are suggestions. hooker makes rules structural.
 
 ## What It Does
 
-hooker sits between Claude Code and its tool calls. Every tool invocation passes through hooker before execution. Three outcomes are possible: **allow**, **deny**, or **transform**.
+hooker sits between Claude Code and its tool calls. Every tool invocation passes through hooker before execution. Policies chain in order — a gate halts the chain, but transforms and injects both fire on the same event.
 
 Three policy types:
 
@@ -26,7 +26,7 @@ Any policy can include a **`when_prompt`** condition — a plain-language LLM cl
 
 ## What It Does Not Do
 
-hooker is a policy layer, not a security boundary. Every error path fails open. If hooker cannot determine the correct action, it permits the action. A broken policy engine must not become a denial-of-service on the agent it governs.
+hooker is a policy layer, not a security boundary. Every error path fails open — the action is permitted, a diagnostic is logged to stderr, and the warning is surfaced to the agent through `additionalContext` in `<hooker-warnings>` tags. If hooker cannot determine the correct action, it permits the action and tells you why — in the session, not just in a log. A broken policy engine must not become a denial-of-service on the agent it governs.
 
 hooker is stateless. It spawns per event, evaluates, exits. No daemon. No persistence. No retained context between invocations.
 
@@ -91,7 +91,7 @@ hooker discovers `.claude/policies.rb` at multiple directory levels by walking u
 
 Broader scopes evaluate first. A system-wide gate fires before a project-level gate. Context files (for `inject` and `transform`) resolve relative to each policy file's root directory — a system-wide `inject "RULES.md"` reads `~/RULES.md`, a project-level one reads `<project>/RULES.md`.
 
-A syntax error in one file skips that file. Other levels still evaluate.
+A syntax error in one file skips that file and logs the error to stderr. Other levels still evaluate.
 
 ## Examples
 
@@ -214,7 +214,7 @@ policy "License header" do
 end
 ```
 
-This matches on `file_path` (to detect `.py` files) but writes the model's response to `content`. Without `field: :content`, the rewritten value would overwrite `file_path`.
+This matches on `file_path` (to detect `.py` files) but writes the model's response to `content`. Without `field: :content`, the default target is the match field — `file_path` for Write — so the model's output would replace the file path instead of the file content.
 
 ### Inject — surface context
 
@@ -276,17 +276,16 @@ Each policy is evaluated in declaration order. Three conditions are AND-ed:
 
 Omitting any condition means it matches everything. Policies that satisfy all three conditions are then filtered through their classifier, if one is defined (via `when_prompt` or raw `classifier` config). The classifier calls `ollama run` with a yes/no prompt. A "no" response discards the policy.
 
-Surviving policies are grouped by type. Execution follows fixed priority:
+Surviving policies are grouped by type. Execution order:
 
-1. **Gates** — the first matching gate denies the action. Evaluation terminates.
-2. **Transforms** — all matching transforms are accumulated. Context files are merged and deduplicated. Prompts are numbered and concatenated. One `claude -p` call executes the combined transformation. The rewritten value replaces the original tool input field.
-3. **Injects** — all matching injects are accumulated. Context files are merged, read, wrapped in `<filename>` tags, and returned as additional context.
+1. **Gates** — the first matching gate denies the action. The chain halts. No transforms or injects fire.
+2. **Transforms** and **injects** both fire. Transforms are accumulated into one `claude -p` call. Injects are accumulated into one context block. The output contains both `updatedInput` and `additionalContext` when both are present.
 
 Context files (for `inject` and `transform`) resolve relative to the directory containing the `.claude/` that defines the policy. A system-wide policy's `inject "RULES.md"` reads `~/RULES.md`; a project policy's reads `<project>/RULES.md`. A syntax error in one policy file skips that file — other levels still evaluate.
 
 If nothing matches, hooker exits silently with code 0.
 
-Every error path fails open. Invalid JSON, missing policies file, malformed regex, invalid Ruby, unreachable `claude` CLI, unreachable `ollama` — all result in allowing the action. This is deliberate. hooker is a policy layer, not a security boundary.
+Every error path fails open — but never silently. Invalid JSON, missing context files, malformed regex, invalid Ruby, unreachable `claude` CLI, unreachable `ollama` — all result in allowing the action, logging to stderr, and surfacing the warning through `additionalContext` wrapped in `<hooker-warnings>` tags. The agent sees the warning in the Claude Code session. The operator sees it in stderr. The action proceeds, but both know why the policy didn't fire. This is deliberate. hooker is a policy layer, not a security boundary.
 
 ## Policy DSL
 
@@ -477,7 +476,7 @@ hooker reads a single JSON object from stdin. Format depends on the event type.
 
 ### Output JSON
 
-hooker writes one of three JSON responses to stdout, or produces no output (silent allow).
+hooker writes a JSON response to stdout, or produces no output (silent allow). When both transforms and injects match the same event, the output contains both fields.
 
 **Gate deny:**
 
@@ -491,7 +490,7 @@ hooker writes one of three JSON responses to stdout, or produces no output (sile
 }
 ```
 
-**Transform (updated input):**
+**Transform + inject (both fire):**
 
 ```json
 {
@@ -499,21 +498,13 @@ hooker writes one of three JSON responses to stdout, or produces no output (sile
     "hookEventName": "PreToolUse",
     "updatedInput": {
       "command": "git commit -m \"the rewritten message\""
-    }
-  }
-}
-```
-
-**Inject (additional context):**
-
-```json
-{
-  "hookSpecificOutput": {
-    "hookEventName": "UserPromptSubmit",
+    },
     "additionalContext": "<REVIEW_PANEL.md>\n...\n</REVIEW_PANEL.md>"
   }
 }
 ```
+
+Either field may appear alone when only transforms or only injects match.
 
 **Allow:** exit code 0, no stdout.
 

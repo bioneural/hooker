@@ -414,9 +414,12 @@ def test_failopen_bad_regex
             tool_input: { command: 'anything' } }
 
   result = run_hooker(input, policies_rb: policies)
+  output = parse_output(result)
 
   assert 'exit 0', result[:exit_code] == 0
-  assert 'no deny output', result[:stdout].strip.empty?
+  assert 'no deny decision', output&.dig('hookSpecificOutput', 'permissionDecision').nil?
+  assert 'warning surfaced in session',
+    output&.dig('hookSpecificOutput', 'additionalContext')&.include?('invalid regex')
   assert 'stderr mentions regex', result[:stderr].include?('invalid regex')
 end
 
@@ -596,7 +599,12 @@ def test_match_constant_unknown
             tool_input: { command: 'git commit -m "test"' } }
 
   result = run_hooker(input, policies_rb: policies)
-  assert 'unknown constant fails open', result[:stdout].strip.empty?
+  output = parse_output(result)
+
+  assert 'unknown constant fails open (no deny)',
+    output&.dig('hookSpecificOutput', 'permissionDecision').nil?
+  assert 'warning surfaced in session',
+    output&.dig('hookSpecificOutput', 'additionalContext')&.include?('unknown match constant')
   assert 'stderr warns about unknown constant', result[:stderr].include?('unknown match constant')
 end
 
@@ -659,9 +667,12 @@ def test_dsl_invalid_ruby_failopen
             tool_input: { command: 'anything' } }
 
   result = run_hooker(input, policies_rb: policies)
+  output = parse_output(result)
 
   assert 'exit 0', result[:exit_code] == 0
-  assert 'no stdout (fail-open)', result[:stdout].strip.empty?
+  assert 'no deny decision', output&.dig('hookSpecificOutput', 'permissionDecision').nil?
+  assert 'warning surfaced in session',
+    output&.dig('hookSpecificOutput', 'additionalContext')&.include?('failed to load policies')
   assert 'stderr mentions failure', result[:stderr].include?('failed to load policies')
 end
 
@@ -896,6 +907,97 @@ def test_hierarchy_broadest_scope_first
   assert 'system gate fires first', output&.dig('hookSpecificOutput', 'permissionDecisionReason') == 'System blocked.'
 end
 
+# -- Chaining Tests --
+
+def test_chain_transform_and_inject
+  puts "\nchain: transform and inject both fire"
+  policies = <<~'RUBY'
+    policy "Rewrite commits" do
+      on :PreToolUse, tool: "Bash", match: "git commit"
+      transform prompt: "Rewrite."
+    end
+
+    policy "Inject identity" do
+      on :PreToolUse, tool: "Bash"
+      inject "IDENTITY.md"
+    end
+  RUBY
+  input = { hook_event_name: 'PreToolUse', tool_name: 'Bash',
+            tool_input: { command: 'git commit -m "fix bug"' } }
+
+  claude_shim = <<~SH
+    #!/bin/sh
+    echo 'git commit -m "rewritten"'
+  SH
+
+  with_shims('claude' => claude_shim) do |path|
+    result = run_hooker(input, policies_rb: policies,
+                        env: { 'PATH' => path },
+                        context_files: { 'IDENTITY.md' => 'I am Vetra.' })
+    output = parse_output(result)
+
+    assert 'has updatedInput', output&.dig('hookSpecificOutput', 'updatedInput').is_a?(Hash)
+    assert 'command was rewritten',
+      output&.dig('hookSpecificOutput', 'updatedInput', 'command')&.include?('rewritten')
+    assert 'has additionalContext',
+      output&.dig('hookSpecificOutput', 'additionalContext')&.include?('I am Vetra.')
+  end
+end
+
+def test_chain_gate_halts
+  puts "\nchain: gate halts — no transforms or injects fire"
+  policies = <<~'RUBY'
+    policy "Block force push" do
+      on :PreToolUse, tool: "Bash", match: "push.*--force"
+      gate "Force push denied."
+    end
+
+    policy "Rewrite commits" do
+      on :PreToolUse, tool: "Bash", match: "."
+      transform prompt: "Rewrite."
+    end
+
+    policy "Inject identity" do
+      on :PreToolUse, tool: "Bash"
+      inject "IDENTITY.md"
+    end
+  RUBY
+  input = { hook_event_name: 'PreToolUse', tool_name: 'Bash',
+            tool_input: { command: 'git push --force origin main' } }
+
+  result = run_hooker(input, policies_rb: policies,
+                      context_files: { 'IDENTITY.md' => 'I am Vetra.' })
+  output = parse_output(result)
+
+  assert 'gate fires', output&.dig('hookSpecificOutput', 'permissionDecision') == 'deny'
+  assert 'no updatedInput', output&.dig('hookSpecificOutput', 'updatedInput').nil?
+  assert 'no additionalContext', output&.dig('hookSpecificOutput', 'additionalContext').nil?
+end
+
+# -- Warning Surfacing Tests --
+
+def test_warnings_surface_in_session
+  puts "\nwarnings: missing context file surfaces in additionalContext"
+  policies = <<~'RUBY'
+    policy "Inject missing" do
+      on :PreToolUse, tool: "Bash"
+      inject "EXISTS.md", "MISSING.md"
+    end
+  RUBY
+  input = { hook_event_name: 'PreToolUse', tool_name: 'Bash',
+            tool_input: { command: 'echo hello' } }
+
+  result = run_hooker(input, policies_rb: policies,
+                      context_files: { 'EXISTS.md' => 'I exist.' })
+  output = parse_output(result)
+  ctx = output&.dig('hookSpecificOutput', 'additionalContext')
+
+  assert 'existing file still surfaced', ctx&.include?('I exist.')
+  assert 'warning in hooker-warnings tags', ctx&.include?('<hooker-warnings>')
+  assert 'warning mentions missing file', ctx&.include?('context file not found')
+  assert 'stderr also has warning', result[:stderr].include?('context file not found')
+end
+
 # -- Runner --
 
 def run_tests
@@ -937,6 +1039,9 @@ def run_tests
   test_hierarchy_context_resolution
   test_hierarchy_syntax_error_skips_file
   test_hierarchy_broadest_scope_first
+  test_chain_transform_and_inject
+  test_chain_gate_halts
+  test_warnings_surface_in_session
 
   puts '=' * 40
   puts "#{$pass} passed, #{$fail} failed"

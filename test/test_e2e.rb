@@ -276,9 +276,12 @@ def test_transform_failopen_claude_missing
 
   # Minimal PATH — no claude binary available
   result = run_hooker(input, policies_rb: policies, env: { 'PATH' => '/usr/bin:/bin' })
+  output = parse_output(result)
 
   assert 'exit 0 (fail-open)', result[:exit_code] == 0
-  assert 'no updatedInput (graceful failure)', result[:stdout].strip.empty?
+  assert 'no updatedInput', output&.dig('hookSpecificOutput', 'updatedInput').nil?
+  assert 'warning surfaced in session',
+    output&.dig('hookSpecificOutput', 'additionalContext')&.include?('claude CLI not found')
 end
 
 # -- Classifier Tests (shimmed) --
@@ -351,9 +354,12 @@ def test_classifier_failopen_ollama_missing
   result = run_hooker(input, policies_rb: policies,
                       env: { 'PATH' => '/usr/bin:/bin' },
                       context_files: { 'REVIEW_PANEL.md' => 'Panel members' })
+  output = parse_output(result)
 
   assert 'exit 0 (fail-open)', result[:exit_code] == 0
-  assert 'no output (classifier failed, policy skipped)', result[:stdout].strip.empty?
+  assert 'no inject (classifier failed)', output&.dig('hookSpecificOutput', 'additionalContext')&.include?('Panel members') != true
+  assert 'warning surfaced in session',
+    output&.dig('hookSpecificOutput', 'additionalContext')&.include?('ollama not found')
 end
 
 def test_classifier_on_gate
@@ -469,6 +475,54 @@ def test_when_prompt_no_fires_without_classifier
 
   assert 'inject fires without classifier (no ollama needed)',
     output&.dig('hookSpecificOutput', 'additionalContext')&.include?('Panel content')
+end
+
+# -- Chaining Tests (shimmed) --
+
+def test_chain_transform_and_inject_e2e
+  puts "\nchain: transform and inject both fire (e2e)"
+  policies = <<~'RUBY'
+    policy "Persona commits" do
+      on :PreToolUse, tool: "Bash", match: "git commit"
+      transform context: "IDENTITY.md",
+        prompt: "Rewrite in persona voice."
+    end
+
+    policy "Inject guidelines" do
+      on :PreToolUse, tool: "Bash"
+      inject "GUIDELINES.md"
+    end
+  RUBY
+  input = { hook_event_name: 'PreToolUse', tool_name: 'Bash',
+            tool_input: { command: 'git commit -m "fix bug"' } }
+
+  claude_shim = <<~SH
+    #!/bin/sh
+    PROMPT=$(cat)
+    if echo "$PROMPT" | grep -q "I am Vetra"; then
+      echo 'git commit -m "structural correction"'
+    else
+      echo 'git commit -m "fallback"'
+    fi
+  SH
+
+  with_shims('claude' => claude_shim) do |path|
+    result = run_hooker(input, policies_rb: policies,
+                        env: { 'PATH' => path },
+                        context_files: {
+                          'IDENTITY.md' => 'I am Vetra.',
+                          'GUIDELINES.md' => 'Follow these guidelines.'
+                        })
+    output = parse_output(result)
+
+    updated = output&.dig('hookSpecificOutput', 'updatedInput')
+    ctx = output&.dig('hookSpecificOutput', 'additionalContext')
+
+    assert 'has updatedInput', updated.is_a?(Hash)
+    assert 'command was rewritten', updated&.dig('command')&.include?('structural correction')
+    assert 'has additionalContext', !ctx.nil?
+    assert 'guidelines injected', ctx&.include?('Follow these guidelines.')
+  end
 end
 
 # -- Hierarchy Tests (shimmed) --
@@ -886,6 +940,9 @@ def run_tests
   test_when_prompt_generates_classifier_prompt
   test_when_prompt_with_custom_model
   test_when_prompt_no_fires_without_classifier
+
+  # Shimmed chaining
+  test_chain_transform_and_inject_e2e
 
   # Shimmed hierarchy
   test_hierarchy_multi_level_transforms
