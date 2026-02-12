@@ -3,7 +3,7 @@
 
 # hooker — declarative policy engine for Claude Code hooks
 # https://github.com/bioneural/hooker
-# MIT License — Copyright (c) 2026 Fort Asset LLC
+# MIT License — Copyright (c) 2026 Kerry Ivan Kurian
 #
 # Reads hook event JSON from stdin, evaluates it against policies defined
 # in .claude/policies.rb, and returns a decision on stdout.
@@ -31,7 +31,7 @@
 #   end
 #
 #   policy "name" do
-#     on :PreToolUse, tool: "Write", file: /README\.md/
+#     on :PreToolUse, tool: "Write", match: /README\.md/, match_field: :file_path
 #     transform context: ["IDENTITY.md", "STYLE.md"],
 #       field: :content,
 #       prompt: "Rewrite in the persona's voice."
@@ -50,7 +50,7 @@
 #
 # DSL methods:
 #
-#   on(event, tool:, match:, match_field:, file:)
+#   on(event, tool:, match:, match_field:)
 #     event       :PreToolUse | :UserPromptSubmit
 #     tool:       regex string on tool name (PreToolUse only)
 #                 known tools: Bash, Edit, MultiEdit, Write, Read,
@@ -60,11 +60,6 @@
 #                 :git_reset, :git_rebase, :git_checkout, :git_switch,
 #                 :git_merge, :git_stash, :git_restore
 #     match_field: :command | :file_path | :pattern | ...
-#     file:       "name" | /regex/
-#                 sugar for match: + match_field: :file_path
-#                 strings are exact filename matches (auto-escaped,
-#                 anchored to path component boundaries)
-#                 regexes match unanchored against the full file_path
 #
 #   gate(message)                               block the action
 #   transform(context:, prompt:, field:, model:) rewrite via claude -p
@@ -92,25 +87,17 @@ module Hooker
       @data = { 'name' => name }
     end
 
-    def on(event, tool: nil, match: nil, match_field: nil, file: nil)
+    def on(event, tool: nil, match: nil, match_field: nil)
       @data['event'] = event.to_s
       @data['tool'] = tool if tool
-      if file
-        @data['match_field'] = 'file_path'
-        @data['match'] = case file
-                         when Regexp then file.source
-                         else "(?:\\A|/)#{Regexp.escape(file.to_s)}\\z"
+      if match
+        @data['match'] = case match
+                         when Symbol then ":#{match}"
+                         when Regexp then match.source
+                         else match.to_s
                          end
-      else
-        if match
-          @data['match'] = case match
-                           when Symbol then ":#{match}"
-                           when Regexp then match.source
-                           else match.to_s
-                           end
-        end
-        @data['match_field'] = match_field.to_s if match_field
       end
+      @data['match_field'] = match_field.to_s if match_field
     end
 
     def gate(message = nil)
@@ -191,20 +178,21 @@ module Hooker
     exit 0
   end
 
-  def find_policy_files(cwd)
-    files = []
+  def find_project_root(cwd)
     dir = File.expand_path(cwd)
     loop do
-      candidate = File.join(dir, '.claude', 'policies.rb')
-      files << { path: candidate, root: dir } if File.exist?(candidate)
+      return dir if File.exist?(File.join(dir, '.claude', 'policies.rb'))
       parent = File.dirname(dir)
-      break if parent == dir
+      return nil if parent == dir
       dir = parent
     end
-    files.reverse
   end
 
-  def load_policies_from(path, root)
+  def load_policies(project_root)
+    return [] if project_root.nil?
+    path = File.join(project_root, '.claude', 'policies.rb')
+    return [] unless File.exist?(path)
+
     policies = []
     sandbox = Object.new
     sandbox.define_singleton_method(:policy) do |name, &block|
@@ -213,15 +201,10 @@ module Hooker
       policies << builder.data
     end
     sandbox.instance_eval(File.read(path), path)
-    policies.each { |p| p['_root'] = root }
     policies
   rescue SyntaxError, StandardError => e
     $stderr.puts "hooker: failed to load policies: #{e.message}"
     []
-  end
-
-  def load_all_policies(policy_files)
-    policy_files.flat_map { |pf| load_policies_from(pf[:path], pf[:root]) }
   end
 
   # -- Match --
@@ -282,28 +265,23 @@ module Hooker
 
   # -- Support --
 
-  def resolve_context_from_policies(policies)
-    seen = {}
+  def read_context_files(paths, project_root)
     parts = []
-    policies.each do |p|
-      root = p['_root']
-      (p['context'] || []).each do |rel_path|
-        abs_path = rel_path.start_with?('/') ? rel_path : File.join(root, rel_path)
-        next if seen[abs_path]
-        seen[abs_path] = true
-        unless File.exist?(abs_path)
-          $stderr.puts "hooker: context file not found: #{abs_path}"
-          next
-        end
-        filename = File.basename(rel_path)
-        parts << "<#{filename}>\n#{File.read(abs_path)}\n</#{filename}>"
+    paths.each do |rel_path|
+      abs_path = rel_path.start_with?('/') ? rel_path : File.join(project_root, rel_path)
+      unless File.exist?(abs_path)
+        $stderr.puts "hooker: context file not found: #{abs_path}"
+        next
       end
+      filename = File.basename(rel_path)
+      parts << "<#{filename}>\n#{File.read(abs_path)}\n</#{filename}>"
     end
     parts.join("\n\n")
   end
 
-  def build_transform_prompt(transforms, event)
-    context = resolve_context_from_policies(transforms)
+  def build_transform_prompt(transforms, event, project_root)
+    all_context_paths = transforms.flat_map { |t| t['context'] || [] }.uniq
+    context = read_context_files(all_context_paths, project_root)
 
     tool_input_json = JSON.pretty_generate(event['tool_input'] || {})
 
@@ -387,8 +365,8 @@ module Hooker
     output_deny(event['hook_event_name'], reason)
   end
 
-  def execute_transforms(transforms, event)
-    prompt = build_transform_prompt(transforms, event)
+  def execute_transforms(transforms, event, project_root)
+    prompt = build_transform_prompt(transforms, event, project_root)
 
     model = transforms.first['model']
     response = call_claude(prompt, model)
@@ -424,19 +402,19 @@ module Hooker
     nil
   end
 
-  def execute_injects(injects, event)
+  def execute_injects(injects, event, project_root)
     parts = []
 
     # File context
-    file_context = resolve_context_from_policies(injects)
+    all_paths = injects.flat_map { |p| p['context'] || [] }.uniq
+    file_context = read_context_files(all_paths, project_root)
     parts << file_context unless file_context.empty?
 
-    # Command context
-    stdin_data = event['prompt'] || event.dig('tool_input', 'command') || ''
+    # Command context — send full event JSON so commands can see all fields
+    stdin_data = event.to_json
     injects.each do |p|
       next unless p['context_command']
-      root = p['_root'] || Dir.pwd
-      result = run_context_command(p['context_command'], root, stdin_data)
+      result = run_context_command(p['context_command'], project_root, stdin_data)
       parts << result if result
     end
 
@@ -485,9 +463,9 @@ module Hooker
 
     event = parse_event(raw)
     cwd = event['cwd'] || Dir.pwd
-    policy_files = find_policy_files(cwd)
+    project_root = find_project_root(cwd)
 
-    policies = load_all_policies(policy_files)
+    policies = load_policies(project_root)
     exit 0 if policies.empty?
 
     matched = find_matching_policies(policies, event)
@@ -501,7 +479,7 @@ module Hooker
 
     # Transforms: all matches accumulated, one claude -p call
     unless matched[:transforms].empty?
-      updated = execute_transforms(matched[:transforms], event)
+      updated = execute_transforms(matched[:transforms], event, project_root)
       if updated
         output_updated_input(event_name, updated)
         exit 0
@@ -510,7 +488,7 @@ module Hooker
 
     # Injects: all matches accumulated
     unless matched[:injects].empty?
-      context = execute_injects(matched[:injects], event)
+      context = execute_injects(matched[:injects], event, project_root)
       if context
         output_additional_context(event_name, context)
         exit 0
