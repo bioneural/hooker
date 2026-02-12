@@ -22,6 +22,8 @@ require 'open3'
 require 'fileutils'
 
 HOOKER = File.expand_path('../bin/hooker', __dir__)
+SCREEN_HOME = ENV['SCREEN_HOME'] || File.expand_path('../../screen', __dir__)
+CLASSIFY_BIN = File.join(SCREEN_HOME, 'bin', 'classify')
 
 # -- Harness --
 
@@ -119,6 +121,17 @@ def with_shims(shims)
       File.chmod(0o755, path)
     end
     yield "#{shim_dir}:#{ENV['PATH']}"
+  end
+end
+
+def with_classify_shim(script_body)
+  Dir.mktmpdir('hooker-screen') do |screen_dir|
+    bin_dir = File.join(screen_dir, 'bin')
+    FileUtils.mkdir_p(bin_dir)
+    path = File.join(bin_dir, 'classify')
+    File.write(path, script_body)
+    File.chmod(0o755, path)
+    yield({ 'SCREEN_HOME' => screen_dir })
   end
 end
 
@@ -287,7 +300,7 @@ end
 # -- Classifier Tests (shimmed) --
 
 def test_classifier_yes
-  puts "\nclassifier: ollama returns yes, inject fires"
+  puts "\nclassifier: classify returns yes, inject fires"
   policies = <<~'RUBY'
     policy "Panel review" do
       on :UserPromptSubmit
@@ -297,14 +310,13 @@ def test_classifier_yes
   RUBY
   input = { hook_event_name: 'UserPromptSubmit', prompt: 'redesign the auth system' }
 
-  ollama_shim = <<~SH
+  classify_shim = <<~SH
     #!/bin/sh
     echo "yes"
   SH
 
-  with_shims('ollama' => ollama_shim) do |path|
-    result = run_hooker(input, policies_rb: policies,
-                        env: { 'PATH' => path },
+  with_classify_shim(classify_shim) do |env|
+    result = run_hooker(input, policies_rb: policies, env: env,
                         context_files: { 'REVIEW_PANEL.md' => 'Panel: Alice, Bob, Carol' })
     output = parse_output(result)
 
@@ -315,7 +327,7 @@ def test_classifier_yes
 end
 
 def test_classifier_no
-  puts "\nclassifier: ollama returns no, inject suppressed"
+  puts "\nclassifier: classify returns no, inject suppressed"
   policies = <<~'RUBY'
     policy "Panel review" do
       on :UserPromptSubmit
@@ -325,22 +337,21 @@ def test_classifier_no
   RUBY
   input = { hook_event_name: 'UserPromptSubmit', prompt: 'fix typo' }
 
-  ollama_shim = <<~SH
+  classify_shim = <<~SH
     #!/bin/sh
     echo "no"
   SH
 
-  with_shims('ollama' => ollama_shim) do |path|
-    result = run_hooker(input, policies_rb: policies,
-                        env: { 'PATH' => path },
+  with_classify_shim(classify_shim) do |env|
+    result = run_hooker(input, policies_rb: policies, env: env,
                         context_files: { 'REVIEW_PANEL.md' => 'Panel: Alice, Bob, Carol' })
 
     assert 'no stdout (suppressed)', result[:stdout].strip.empty?
   end
 end
 
-def test_classifier_failopen_ollama_missing
-  puts "\nclassifier: fail-open when ollama not in PATH"
+def test_classifier_failopen_classify_missing
+  puts "\nclassifier: fail-open when classify not found"
   policies = <<~'RUBY'
     policy "Panel review" do
       on :UserPromptSubmit
@@ -350,16 +361,15 @@ def test_classifier_failopen_ollama_missing
   RUBY
   input = { hook_event_name: 'UserPromptSubmit', prompt: 'redesign auth' }
 
-  # Minimal PATH — no ollama binary available
+  # Point SCREEN_HOME to a nonexistent directory
   result = run_hooker(input, policies_rb: policies,
-                      env: { 'PATH' => '/usr/bin:/bin' },
+                      env: { 'SCREEN_HOME' => '/nonexistent/screen' },
                       context_files: { 'REVIEW_PANEL.md' => 'Panel members' })
   output = parse_output(result)
 
   assert 'exit 0 (fail-open)', result[:exit_code] == 0
   assert 'no inject (classifier failed)', output&.dig('hookSpecificOutput', 'additionalContext')&.include?('Panel members') != true
-  assert 'warning surfaced in session',
-    output&.dig('hookSpecificOutput', 'additionalContext')&.include?('ollama not found')
+  assert 'warning mentions classify not found', result[:stderr].include?('classify not found')
 end
 
 def test_classifier_on_gate
@@ -374,13 +384,13 @@ def test_classifier_on_gate
   input = { hook_event_name: 'PreToolUse', tool_name: 'Bash',
             tool_input: { command: 'deploy --production' } }
 
-  ollama_shim = <<~SH
+  classify_shim = <<~SH
     #!/bin/sh
     echo "yes"
   SH
 
-  with_shims('ollama' => ollama_shim) do |path|
-    result = run_hooker(input, policies_rb: policies, env: { 'PATH' => path })
+  with_classify_shim(classify_shim) do |env|
+    result = run_hooker(input, policies_rb: policies, env: env)
     output = parse_output(result)
 
     assert 'gate fires with classifier yes',
@@ -401,8 +411,8 @@ def test_when_prompt_generates_classifier_prompt
   RUBY
   input = { hook_event_name: 'UserPromptSubmit', prompt: 'redesign the database schema' }
 
-  # Shim captures the prompt sent to ollama and checks it contains the condition
-  ollama_shim = <<~SH
+  # Shim checks that the condition appears in the JSON passed to classify
+  classify_shim = <<~SH
     #!/bin/sh
     INPUT=$(cat)
     if echo "$INPUT" | grep -q "architectural decisions"; then
@@ -412,19 +422,18 @@ def test_when_prompt_generates_classifier_prompt
     fi
   SH
 
-  with_shims('ollama' => ollama_shim) do |path|
-    result = run_hooker(input, policies_rb: policies,
-                        env: { 'PATH' => path },
+  with_classify_shim(classify_shim) do |env|
+    result = run_hooker(input, policies_rb: policies, env: env,
                         context_files: { 'REVIEW_PANEL.md' => 'Panel content here' })
     output = parse_output(result)
 
-    assert 'when_prompt condition passed to ollama',
+    assert 'when_prompt condition passed to classify',
       output&.dig('hookSpecificOutput', 'additionalContext')&.include?('Panel content here')
   end
 end
 
 def test_when_prompt_with_custom_model
-  puts "\nwhen_prompt: custom model passed to ollama"
+  puts "\nwhen_prompt: custom model passed via classify JSON"
   policies = <<~'RUBY'
     policy "Custom model review" do
       on :UserPromptSubmit
@@ -434,20 +443,20 @@ def test_when_prompt_with_custom_model
   RUBY
   input = { hook_event_name: 'UserPromptSubmit', prompt: 'audit the auth system' }
 
-  # Shim checks the model argument
-  ollama_shim = <<~SH
+  # Shim checks the model in the JSON input
+  classify_shim = <<~SH
     #!/bin/sh
-    if [ "$2" = "llama3:8b" ]; then
+    INPUT=$(cat)
+    if echo "$INPUT" | grep -q '"model":"llama3:8b"'; then
       echo "yes"
     else
-      echo "WRONG_MODEL: got $2" >&2
+      echo "WRONG_MODEL" >&2
       echo "no"
     fi
   SH
 
-  with_shims('ollama' => ollama_shim) do |path|
-    result = run_hooker(input, policies_rb: policies,
-                        env: { 'PATH' => path },
+  with_classify_shim(classify_shim) do |env|
+    result = run_hooker(input, policies_rb: policies, env: env,
                         context_files: { 'SECURITY.md' => 'Security guidelines' })
     output = parse_output(result)
 
@@ -607,6 +616,7 @@ end
 
 HAVE_CLAUDE = system('which claude > /dev/null 2>&1')
 HAVE_OLLAMA = system('which ollama > /dev/null 2>&1')
+HAVE_SCREEN = File.executable?(CLASSIFY_BIN)
 LIVE = ENV['HOOKER_E2E_LIVE']
 
 def setup_live_repo(policies_rb:, context_files: {})
@@ -817,9 +827,9 @@ ensure
 end
 
 def test_live_classifier_yes
-  puts "\nlive: classifier triggers inject via real ollama"
-  unless LIVE && HAVE_OLLAMA
-    return skip('live classifier yes', 'requires ollama and HOOKER_E2E_LIVE=1')
+  puts "\nlive: classifier triggers inject via real classify"
+  unless LIVE && HAVE_SCREEN && HAVE_OLLAMA
+    return skip('live classifier yes', 'requires screen + ollama and HOOKER_E2E_LIVE=1')
   end
 
   policies = <<~'RUBY'
@@ -858,9 +868,9 @@ ensure
 end
 
 def test_live_classifier_no
-  puts "\nlive: classifier suppresses inject via real ollama"
-  unless LIVE && HAVE_OLLAMA
-    return skip('live classifier no', 'requires ollama and HOOKER_E2E_LIVE=1')
+  puts "\nlive: classifier suppresses inject via real classify"
+  unless LIVE && HAVE_SCREEN && HAVE_OLLAMA
+    return skip('live classifier no', 'requires screen + ollama and HOOKER_E2E_LIVE=1')
   end
 
   policies = <<~'RUBY'
@@ -933,7 +943,7 @@ def run_tests
   # Shimmed classifiers
   test_classifier_yes
   test_classifier_no
-  test_classifier_failopen_ollama_missing
+  test_classifier_failopen_classify_missing
   test_classifier_on_gate
 
   # Shimmed when_prompt

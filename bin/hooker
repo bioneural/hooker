@@ -77,6 +77,9 @@
 require 'json'
 require 'open3'
 
+SCREEN_HOME = ENV['SCREEN_HOME'] || File.expand_path('../../screen', File.dirname(__FILE__))
+CLASSIFY_BIN = File.join(SCREEN_HOME, 'bin', 'classify')
+
 module Hooker
   # -- DSL --
 
@@ -178,14 +181,16 @@ module Hooker
     exit 0
   end
 
-  def find_project_root(cwd)
+  def find_project_roots(cwd)
+    roots = []
     dir = File.expand_path(cwd)
     loop do
-      return dir if File.exist?(File.join(dir, '.claude', 'policies.rb'))
+      roots << dir if File.exist?(File.join(dir, '.claude', 'policies.rb'))
       parent = File.dirname(dir)
-      return nil if parent == dir
+      break if parent == dir
       dir = parent
     end
+    roots
   end
 
   def load_policies(project_root)
@@ -279,9 +284,24 @@ module Hooker
     parts.join("\n\n")
   end
 
-  def build_transform_prompt(transforms, event, project_root)
-    all_context_paths = transforms.flat_map { |t| t['context'] || [] }.uniq
-    context = read_context_files(all_context_paths, project_root)
+  def build_transform_prompt(transforms, event)
+    context_parts = []
+    seen = {}
+    transforms.each do |t|
+      root = t['_root']
+      (t['context'] || []).each do |rel_path|
+        abs = rel_path.start_with?('/') ? rel_path : File.join(root, rel_path)
+        next if seen[abs]
+        seen[abs] = true
+        unless File.exist?(abs)
+          $stderr.puts "hooker: context file not found: #{abs}"
+          next
+        end
+        filename = File.basename(rel_path)
+        context_parts << "<#{filename}>\n#{File.read(abs)}\n</#{filename}>"
+      end
+    end
+    context = context_parts.join("\n\n")
 
     tool_input_json = JSON.pretty_generate(event['tool_input'] || {})
 
@@ -303,18 +323,19 @@ module Hooker
     cmd += ['--model', model] if model
     stdout, status = Open3.capture2(*cmd, stdin_data: prompt)
     unless status.success?
-      $stderr.puts "hooker: claude -p exited with #{status.exitstatus}"
-      return nil
+      warning = "claude -p exited with #{status.exitstatus}"
+      $stderr.puts "hooker: #{warning}"
+      return [nil, warning]
     end
     result = stdout.strip
     result = result.sub(/\A```\w*\n?/, '').sub(/\n?```\z/, '').strip
-    result
+    [result, nil]
   rescue Errno::ENOENT
     $stderr.puts 'hooker: claude CLI not found'
-    nil
+    [nil, 'claude CLI not found']
   rescue => e
     $stderr.puts "hooker: claude -p failed: #{e.message}"
-    nil
+    [nil, "claude -p failed: #{e.message}"]
   end
 
   def call_ollama(prompt, model = 'gemma3:1b')
@@ -337,25 +358,37 @@ module Hooker
     return nil unless policy['when']
 
     {
-      'model' => policy['when_model'] || 'gemma3:1b',
-      'prompt' => "You are a classifier. Respond with exactly \"yes\" if " \
-                  "the following condition applies to the input. Otherwise " \
-                  "respond \"no\". Output only \"yes\" or \"no\".\n\n" \
-                  "Condition: #{policy['when']}"
+      'condition' => policy['when'],
+      'model' => policy['when_model'] || 'gemma3:1b'
     }
   end
 
   def classify?(classifier, event)
     return true if classifier.nil?
-    model = classifier['model'] || 'gemma3:1b'
-    prompt = classifier['prompt'] || 'Does this warrant review? Answer only yes or no.'
+    condition = classifier['condition'] || classifier['prompt']
+    return true unless condition
 
-    input_text = event['prompt'] || event.dig('tool_input', 'command') || ''
-    full_prompt = "#{prompt}\n\nInput: #{input_text}"
+    input = {
+      'condition' => condition,
+      'model'     => classifier['model'] || 'gemma3:1b',
+      'file_path' => event.dig('tool_input', 'file_path'),
+      'command'   => event.dig('tool_input', 'command'),
+      'prompt'    => event['prompt'],
+      'content'   => event.dig('tool_input', 'content'),
+    }.compact
 
-    result = call_ollama(full_prompt, model)
-    return false if result.nil?
-    result.downcase.start_with?('yes')
+    stdout, status = Open3.capture2(CLASSIFY_BIN, stdin_data: JSON.generate(input))
+    unless status.success?
+      $stderr.puts "hooker: classify exited with #{status.exitstatus}"
+      return false
+    end
+    stdout.strip.downcase.start_with?('yes')
+  rescue Errno::ENOENT
+    $stderr.puts "hooker: classify not found at #{CLASSIFY_BIN}"
+    false
+  rescue => e
+    $stderr.puts "hooker: classification failed: #{e.message}"
+    false
   end
 
   # -- Execute --
@@ -365,12 +398,12 @@ module Hooker
     output_deny(event['hook_event_name'], reason)
   end
 
-  def execute_transforms(transforms, event, project_root)
-    prompt = build_transform_prompt(transforms, event, project_root)
+  def execute_transforms(transforms, event)
+    prompt = build_transform_prompt(transforms, event)
 
     model = transforms.first['model']
-    response = call_claude(prompt, model)
-    return nil if response.nil? || response.empty?
+    response, warning = call_claude(prompt, model)
+    return [nil, warning] if response.nil? || response.empty?
 
     field = transforms.first['transform_field'] ||
             transforms.first['match_field'] ||
@@ -379,7 +412,7 @@ module Hooker
 
     updated = (event['tool_input'] || {}).dup
     updated[field] = response
-    updated
+    [updated, nil]
   end
 
   def run_context_command(command, project_root, stdin_data = nil)
@@ -402,19 +435,32 @@ module Hooker
     nil
   end
 
-  def execute_injects(injects, event, project_root)
+  def execute_injects(injects, event)
     parts = []
 
-    # File context
-    all_paths = injects.flat_map { |p| p['context'] || [] }.uniq
-    file_context = read_context_files(all_paths, project_root)
-    parts << file_context unless file_context.empty?
+    # File context — resolve each path relative to its policy's root
+    seen = {}
+    injects.each do |p|
+      root = p['_root']
+      (p['context'] || []).each do |rel_path|
+        abs = rel_path.start_with?('/') ? rel_path : File.join(root, rel_path)
+        next if seen[abs]
+        seen[abs] = true
+        unless File.exist?(abs)
+          $stderr.puts "hooker: context file not found: #{abs}"
+          next
+        end
+        filename = File.basename(rel_path)
+        parts << "<#{filename}>\n#{File.read(abs)}\n</#{filename}>"
+      end
+    end
 
     # Command context — send full event JSON so commands can see all fields
     stdin_data = event.to_json
     injects.each do |p|
       next unless p['context_command']
-      result = run_context_command(p['context_command'], project_root, stdin_data)
+      root = p['_root']
+      result = run_context_command(p['context_command'], root, stdin_data)
       parts << result if result
     end
 
@@ -451,8 +497,37 @@ module Hooker
     })
   end
 
+  def output_response(event_name, response)
+    hook_output = { hookEventName: event_name }
+    hook_output[:updatedInput] = response[:updated_input] if response[:updated_input]
+
+    ctx_parts = []
+    ctx_parts << response[:context] if response[:context]
+    ctx_parts << "hooker: #{response[:warning]}" if response[:warning]
+    hook_output[:additionalContext] = ctx_parts.join("\n\n") unless ctx_parts.empty?
+
+    puts JSON.generate({ hookSpecificOutput: hook_output })
+  end
+
   def output_allow
     exit 0
+  end
+
+  # -- Environment --
+
+  def load_dotenv(dir)
+    env_path = File.join(dir, '.env')
+    return unless File.exist?(env_path)
+    File.foreach(env_path) do |line|
+      line = line.strip
+      next if line.empty? || line.start_with?('#')
+      next unless line.include?('=')
+      key, value = line.split('=', 2)
+      next unless key && value && !key.empty?
+      ENV[key] ||= value
+    end
+  rescue => e
+    $stderr.puts "hooker: failed to load .env: #{e.message}"
   end
 
   # -- Entry --
@@ -463,12 +538,19 @@ module Hooker
 
     event = parse_event(raw)
     cwd = event['cwd'] || Dir.pwd
-    project_root = find_project_root(cwd)
 
-    policies = load_policies(project_root)
-    exit 0 if policies.empty?
+    # Walk up from cwd, collect all policy roots (deepest first)
+    roots = find_project_roots(cwd)
+    load_dotenv(roots.first) if roots.any?
+    all_policies = []
+    roots.each do |root|
+      root_policies = load_policies(root)
+      root_policies.each { |p| p['_root'] = root }
+      all_policies.concat(root_policies)
+    end
+    exit 0 if all_policies.empty?
 
-    matched = find_matching_policies(policies, event)
+    matched = find_matching_policies(all_policies, event)
     event_name = event['hook_event_name']
 
     # Gates: first match denies
@@ -477,27 +559,29 @@ module Hooker
       exit 0
     end
 
+    response = {}
+
     # Transforms: all matches accumulated, one claude -p call
     unless matched[:transforms].empty?
-      updated = execute_transforms(matched[:transforms], event, project_root)
-      if updated
-        output_updated_input(event_name, updated)
-        exit 0
-      end
+      updated, warning = execute_transforms(matched[:transforms], event)
+      response[:updated_input] = updated if updated
+      response[:warning] = warning if warning && !updated
     end
 
     # Injects: all matches accumulated
     unless matched[:injects].empty?
-      context = execute_injects(matched[:injects], event, project_root)
+      context = execute_injects(matched[:injects], event)
       if context
         names = matched[:injects].map { |p| p['name'] }.join(', ')
-        context = "#{context}\n\n<hooker:matched>#{names}</hooker:matched>"
-        output_additional_context(event_name, context)
-        exit 0
+        response[:context] = "#{context}\n\n<hooker:matched>#{names}</hooker:matched>"
       end
     end
 
-    output_allow
+    if response.empty?
+      output_allow
+    else
+      output_response(event_name, response)
+    end
   end
 end
 
