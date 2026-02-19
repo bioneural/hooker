@@ -424,6 +424,19 @@ Return ONLY the transformed value. No explanation, no markdown fencing.
 
 The model's response replaces the value of the target field (`field:`, or the default match field). Write your `prompt:` knowing that the model can reference context files by their `<filename>` tags and can see the full tool input JSON.
 
+**`command:` variant.** Instead of calling `claude -p`, run a command and merge its JSON output into `tool_input`:
+
+```ruby
+policy "Background post commits" do
+  on :PreToolUse, tool: "Bash", match: :git_commit
+  transform command: "bin/background-post-commits.sh"
+end
+```
+
+The command receives the full hook event JSON on stdin. It outputs a JSON object with the fields to change. hooker merges the output into `tool_input` and returns `updatedInput`. No `claude -p` call. Use this for deterministic rewrites that don't require AI judgment.
+
+If the command exits non-zero or returns invalid JSON, the transform is skipped (fail-open). Multiple command transforms run independently; multiple AI transforms are still accumulated into one `claude -p` call. Both types can match the same event — command transforms run first, then AI transforms.
+
 ### `inject(*files, command:)`
 
 Surfaces context to the agent before it reasons.
@@ -512,7 +525,7 @@ Either field may appear alone when only transforms or only injects match.
 
 Ruby. Standard library only. No gems.
 
-Transforms invoke `claude -p` — authentication is inherited from the active Claude Code session. Classifiers invoke `ollama run` — required only when policies use `when_prompt`.
+AI transforms invoke `claude -p` — authentication is inherited from the active Claude Code session. Command transforms (`transform command:`) run a shell command with no external dependencies. Classifiers invoke `ollama run` — required only when policies use `when_prompt`.
 
 ## Testing
 

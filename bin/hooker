@@ -50,7 +50,7 @@
 #
 # DSL methods:
 #
-#   on(event, tool:, match:, match_field:)
+#   on(event, tool:, match:, match_field:, file:)
 #     event       :PreToolUse | :UserPromptSubmit
 #     tool:       regex string on tool name (PreToolUse only)
 #                 known tools: Bash, Edit, MultiEdit, Write, Read,
@@ -60,9 +60,13 @@
 #                 :git_reset, :git_rebase, :git_checkout, :git_switch,
 #                 :git_merge, :git_stash, :git_restore
 #     match_field: :command | :file_path | :pattern | ...
+#     file:       "name" | /regex/ — sugar for match_field: :file_path
+#                 strings match exact basename or path suffix
+#                 regexes match against the full file_path
 #
 #   gate(message)                               block the action
 #   transform(context:, prompt:, field:, model:) rewrite via claude -p
+#   transform(command:)                          rewrite via command (JSON merge)
 #   inject(*files, command:)                     surface context files or command output
 #   when_prompt(condition, model:)              LLM-only plain language matching
 #
@@ -72,7 +76,8 @@
 #     "hooks": [{ "type": "command", "command": "bin/hooker" }] }] } }
 #
 # Dependencies: Ruby stdlib only (json, open3). No gems. No API keys.
-# Transforms use `claude -p`. Classifiers use `ollama run`.
+# AI transforms use `claude -p`. Command transforms run a script.
+# Classifiers use `ollama run`.
 
 require 'json'
 require 'open3'
@@ -83,9 +88,11 @@ require 'fileutils'
 # Writes to a SQLite database at .state/spill/spill.db via sqlite3 CLI.
 SPILL_DB = ENV['SPILL_DB'] || File.join(Dir.pwd, '.state', 'spill', 'spill.db')
 @spill_db_ready = false
+HOOKER_WARNINGS = []
 
 def spill(level, msg, **ctx)
   $stderr.puts "hooker: #{msg}"
+  HOOKER_WARNINGS << msg
   unless @spill_db_ready
     dir = File.dirname(SPILL_DB)
     FileUtils.mkdir_p(dir) unless File.directory?(dir)
@@ -124,17 +131,23 @@ module Hooker
       @data = { 'name' => name }
     end
 
-    def on(event, tool: nil, match: nil, match_field: nil)
+    def on(event, tool: nil, match: nil, match_field: nil, file: nil)
       @data['event'] = event.to_s
       @data['tool'] = tool if tool
-      if match
+      if file
+        @data['match_field'] = 'file_path'
+        @data['match'] = case file
+                         when Regexp then file.source
+                         else "(^|/)#{Regexp.escape(file.to_s)}\\z"
+                         end
+      elsif match
         @data['match'] = case match
                          when Symbol then ":#{match}"
                          when Regexp then match.source
                          else match.to_s
                          end
+        @data['match_field'] = match_field.to_s if match_field
       end
-      @data['match_field'] = match_field.to_s if match_field
     end
 
     def gate(message = nil)
@@ -142,12 +155,16 @@ module Hooker
       @data['message'] = message if message
     end
 
-    def transform(context: nil, prompt: nil, field: nil, model: nil)
+    def transform(context: nil, prompt: nil, field: nil, model: nil, command: nil)
       @data['type'] = 'transform'
-      @data['context'] = Array(context) if context
-      @data['prompt'] = prompt if prompt
-      @data['transform_field'] = field.to_s if field
-      @data['model'] = model if model
+      if command
+        @data['transform_command'] = command
+      else
+        @data['context'] = Array(context) if context
+        @data['prompt'] = prompt if prompt
+        @data['transform_field'] = field.to_s if field
+        @data['model'] = model if model
+      end
     end
 
     def inject(*files, command: nil)
@@ -433,20 +450,45 @@ module Hooker
   end
 
   def execute_transforms(transforms, event)
-    prompt = build_transform_prompt(transforms, event)
-
-    model = transforms.first['model']
-    response, warning = call_claude(prompt, model)
-    return [nil, warning] if response.nil? || response.empty?
-
-    field = transforms.first['transform_field'] ||
-            transforms.first['match_field'] ||
-            DEFAULT_MATCH_FIELDS[event['tool_name']] ||
-            'command'
+    command_transforms = transforms.select { |t| t['transform_command'] }
+    ai_transforms = transforms.reject { |t| t['transform_command'] }
 
     updated = (event['tool_input'] || {}).dup
-    updated[field] = response
-    [updated, nil]
+    changed = false
+    last_warning = nil
+
+    # Command transforms: each runs independently, merge JSON output
+    command_transforms.each do |t|
+      root = t['_root']
+      result = run_context_command(t['transform_command'], root, event.to_json)
+      next if result.nil?
+      begin
+        patch = JSON.parse(result)
+        updated.merge!(patch)
+        changed = true
+      rescue JSON::ParserError => e
+        spill('error', "transform command '#{t['name']}' returned invalid JSON: #{e.message}")
+      end
+    end
+
+    # AI transforms: accumulated into one claude -p call
+    unless ai_transforms.empty?
+      prompt = build_transform_prompt(ai_transforms, event)
+      model = ai_transforms.first['model']
+      response, warning = call_claude(prompt, model)
+      if response && !response.empty?
+        field = ai_transforms.first['transform_field'] ||
+                ai_transforms.first['match_field'] ||
+                DEFAULT_MATCH_FIELDS[event['tool_name']] ||
+                'command'
+        updated[field] = response
+        changed = true
+      else
+        last_warning = warning
+      end
+    end
+
+    [changed ? updated : nil, last_warning]
   end
 
   def run_context_command(command, project_root, stdin_data = nil)
@@ -573,16 +615,23 @@ module Hooker
     event = parse_event(raw)
     cwd = event['cwd'] || Dir.pwd
 
-    # Walk up from cwd, collect all policy roots (deepest first)
+    # Walk up from cwd, collect all policy roots; reverse so broadest scope first
     roots = find_project_roots(cwd)
-    load_dotenv(roots.first) if roots.any?
+    load_dotenv(roots.first) if roots.any?  # deepest root (closest to cwd)
+    roots.reverse!  # broadest scope first for policy evaluation
     all_policies = []
     roots.each do |root|
       root_policies = load_policies(root)
       root_policies.each { |p| p['_root'] = root }
       all_policies.concat(root_policies)
     end
-    exit 0 if all_policies.empty?
+    if all_policies.empty?
+      unless HOOKER_WARNINGS.empty?
+        warning_text = "<hooker-warnings>\n#{HOOKER_WARNINGS.join("\n")}\n</hooker-warnings>"
+        output_additional_context(event['hook_event_name'], warning_text)
+      end
+      exit 0
+    end
 
     matched = find_matching_policies(all_policies, event)
     event_name = event['hook_event_name']
@@ -609,6 +658,12 @@ module Hooker
         names = matched[:injects].map { |p| p['name'] }.join(', ')
         response[:context] = "#{context}\n\n<hooker:matched>#{names}</hooker:matched>"
       end
+    end
+
+    # Surface accumulated warnings in additionalContext
+    unless HOOKER_WARNINGS.empty?
+      warning_text = "<hooker-warnings>\n#{HOOKER_WARNINGS.join("\n")}\n</hooker-warnings>"
+      response[:context] = response[:context] ? "#{response[:context]}\n\n#{warning_text}" : warning_text
     end
 
     if response.empty?
