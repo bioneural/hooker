@@ -76,6 +76,7 @@
 #     "hooks": [{ "type": "command", "command": "bin/hooker" }] }] } }
 #
 # Dependencies: Ruby stdlib only (json, open3). No gems. No API keys.
+# Logging via spill (sibling directory) if present, stderr fallback otherwise.
 # AI transforms use `claude -p`. Command transforms run a script.
 # Classifiers use `ollama run`.
 
@@ -83,39 +84,21 @@ require 'json'
 require 'open3'
 require 'fileutils'
 
-# -- Inline structured logging (spill protocol) --
-# hooker cannot require external files — this is the minimal inline equivalent.
-# Writes to a SQLite database at .state/spill/spill.db via sqlite3 CLI.
-SPILL_DB = ENV['SPILL_DB'] || File.join(Dir.pwd, '.state', 'spill', 'spill.db')
-@spill_db_ready = false
+# -- Structured logging via spill --
+SPILL_HOME = ENV['SPILL_HOME'] || File.expand_path('../../spill', File.dirname(__FILE__))
+if File.directory?(SPILL_HOME)
+  require File.join(SPILL_HOME, 'lib', 'spill')
+  Spill.configure(tool: 'hooker')
+end
 HOOKER_WARNINGS = []
 
 def spill(level, msg, **ctx)
-  $stderr.puts "hooker: #{msg}"
   HOOKER_WARNINGS << msg
-  unless @spill_db_ready
-    dir = File.dirname(SPILL_DB)
-    FileUtils.mkdir_p(dir) unless File.directory?(dir)
-    Open3.capture2('sqlite3', SPILL_DB, stdin_data: <<~SQL, err: File::NULL)
-      PRAGMA busy_timeout = 5000;
-      PRAGMA journal_mode = WAL;
-      CREATE TABLE IF NOT EXISTS log (
-        id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
-        tool TEXT NOT NULL, level TEXT NOT NULL, msg TEXT NOT NULL,
-        pid INTEGER NOT NULL, ctx TEXT
-      );
-    SQL
-    @spill_db_ready = true
+  if defined?(Spill)
+    Spill.send(level, msg, **ctx)
+  else
+    $stderr.puts "hooker: #{msg}"
   end
-  ts = Time.now.utc.strftime('%Y-%m-%dT%H:%M:%S.%3NZ')
-  escaped = msg.gsub("'", "''")
-  ctx_sql = ctx.empty? ? 'NULL' : "'#{JSON.generate(ctx).gsub("'", "''")}'"
-  Open3.capture2('sqlite3', SPILL_DB, stdin_data:
-    "PRAGMA busy_timeout = 5000; INSERT INTO log (ts,tool,level,msg,pid,ctx) " \
-    "VALUES ('#{ts}','hooker','#{level}','#{escaped}',#{Process.pid},#{ctx_sql});",
-    err: File::NULL)
-rescue
-  nil # fail-open
 end
 
 SCREEN_HOME = ENV['SCREEN_HOME'] || File.expand_path('../../screen', File.dirname(__FILE__))
