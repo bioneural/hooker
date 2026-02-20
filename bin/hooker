@@ -75,7 +75,7 @@
 #   { "hooks": { "PreToolUse": [{ "matcher": "Bash|Edit|Write",
 #     "hooks": [{ "type": "command", "command": "bin/hooker" }] }] } }
 #
-# Dependencies: Ruby stdlib only (json, open3). No gems. No API keys.
+# Dependencies: Ruby stdlib plus the sqlite3 gem. No other gems. No API keys.
 # Logging via spill (sibling directory) if present, stderr fallback otherwise.
 # AI transforms use `claude -p`. Command transforms run a script.
 # Classifiers use `ollama run`.
@@ -355,7 +355,7 @@ module Hooker
   def call_claude(prompt, model = nil)
     cmd = ['claude', '-p']
     cmd += ['--model', model] if model
-    stdout, status = Open3.capture2(*cmd, stdin_data: prompt)
+    stdout, status = Open3.capture2({ 'CLAUDECODE' => nil }, *cmd, stdin_data: prompt)
     unless status.success?
       warning = "claude -p exited with #{status.exitstatus}"
       spill('warn', warning)
