@@ -657,4 +657,30 @@ module Hooker
   end
 end
 
-Hooker.run
+if ARGV.first == 'doctor'
+  report = {}
+
+  report['ruby'] = { 'version' => RUBY_VERSION, 'ok' => true }
+
+  # Spill loadable
+  report['spill'] = { 'path' => SPILL_HOME, 'ok' => defined?(Spill) ? true : false }
+
+  # Screen/classify exists
+  report['classify'] = { 'path' => CLASSIFY_BIN, 'ok' => File.executable?(CLASSIFY_BIN) }
+
+  # Policies loadable from cwd
+  policies_path = File.join(Dir.pwd, '.claude', 'policies.rb')
+  if File.exist?(policies_path)
+    _, stderr, status = Open3.capture3('ruby', '-c', policies_path)
+    report['policies'] = { 'path' => policies_path, 'ok' => status.success? }
+    report['policies']['error'] = stderr.strip unless status.success?
+  else
+    report['policies'] = { 'path' => policies_path, 'ok' => true, 'note' => 'not found (optional)' }
+  end
+
+  report['ok'] = report.values.all? { |v| v.is_a?(Hash) ? v['ok'] != false : true }
+  puts JSON.pretty_generate(report)
+  exit(report['ok'] ? 0 : 1)
+else
+  Hooker.run
+end
