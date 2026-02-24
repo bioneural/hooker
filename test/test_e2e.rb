@@ -14,7 +14,7 @@
 # Each test creates a temporary project directory with .claude/policies.rb,
 # pipes JSON to bin/hooker via Open3, and asserts on stdout / stderr / exit code.
 #
-# Dependencies: Ruby stdlib only (json, tmpdir, open3, fileutils).
+# Dependencies: Ruby stdlib plus the sqlite3 gem (json, tmpdir, open3, fileutils).
 
 require 'json'
 require 'tmpdir'

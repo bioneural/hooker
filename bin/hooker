@@ -93,7 +93,7 @@ end
 HOOKER_WARNINGS = []
 
 def spill(level, msg, **ctx)
-  HOOKER_WARNINGS << msg
+  HOOKER_WARNINGS << msg if %w[warn error].include?(level.to_s)
   if defined?(Spill)
     Spill.send(level, msg, **ctx)
   else
@@ -618,6 +618,16 @@ module Hooker
 
     matched = find_matching_policies(all_policies, event)
     event_name = event['hook_event_name']
+
+    matched[:gates].each do |p|
+      spill('info', "gate matched: #{p['name']}", policy_name: p['name'], event_type: event_name, decision: 'deny', tool: 'hooker')
+    end
+    matched[:transforms].each do |p|
+      spill('info', "transform matched: #{p['name']}", policy_name: p['name'], event_type: event_name, decision: 'transform', tool: 'hooker')
+    end
+    matched[:injects].each do |p|
+      spill('info', "inject matched: #{p['name']}", policy_name: p['name'], event_type: event_name, decision: 'inject', tool: 'hooker')
+    end
 
     # Gates: first match denies
     unless matched[:gates].empty?
