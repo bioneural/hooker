@@ -688,6 +688,34 @@ if ARGV.first == 'doctor'
     report['policies'] = { 'path' => policies_path, 'ok' => true, 'note' => 'not found (optional)' }
   end
 
+  # Probe
+  if ARGV.include?('--probe')
+    begin
+      probe_event = JSON.generate({
+        'hook_event_name' => 'PreToolUse',
+        'tool_name' => 'Bash',
+        'input' => { 'command' => 'echo probe' },
+        'cwd' => Dir.pwd
+      })
+      output, _, status = Open3.capture3('ruby', __FILE__, stdin_data: probe_event)
+      if status.success?
+        if output.strip.empty?
+          report['probe'] = { 'ok' => true }
+        else
+          parsed = JSON.parse(output)
+          has_key = parsed.key?('hookSpecificOutput')
+          report['probe'] = { 'ok' => true }
+          report['probe']['warn'] = 'output missing hookSpecificOutput key' unless has_key
+        end
+      else
+        report['probe'] = { 'ok' => true, 'warn' => "probe exit #{status.exitstatus}" }
+      end
+    rescue => e
+      report['probe'] = { 'ok' => true, 'warn' => "probe error: #{e.message}" }
+    end
+  end
+
+  report['protocol_version'] = 1
   report['ok'] = report.values.all? { |v| v.is_a?(Hash) ? v['ok'] != false : true }
   puts JSON.pretty_generate(report)
   exit(report['ok'] ? 0 : 1)
