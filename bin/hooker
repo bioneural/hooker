@@ -372,7 +372,7 @@ module Hooker
     [nil, "claude -p failed: #{e.message}"]
   end
 
-  def call_ollama(prompt, model = 'gemma3:1b')
+  def call_ollama(prompt, model = 'gemma3:4b')
     stdout, status = Open3.capture2('ollama', 'run', model, stdin_data: prompt)
     unless status.success?
       spill('error', "ollama exited with #{status.exitstatus}")
@@ -393,7 +393,7 @@ module Hooker
 
     {
       'condition' => policy['when'],
-      'model' => policy['when_model'] || 'gemma3:1b'
+      'model' => policy['when_model'] || 'gemma3:4b'
     }
   end
 
@@ -404,7 +404,7 @@ module Hooker
 
     input = {
       'condition' => condition,
-      'model'     => classifier['model'] || 'gemma3:1b',
+      'model'     => classifier['model'] || 'gemma3:4b',
       'file_path' => event.dig('tool_input', 'file_path'),
       'command'   => event.dig('tool_input', 'command'),
       'prompt'    => event['prompt'],

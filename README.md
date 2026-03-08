@@ -240,7 +240,7 @@ Input:
 }
 ```
 
-hooker sends the prompt to `ollama run gemma3:1b` with a yes/no classifier. The model responds "yes" — the condition matches. hooker reads `REVIEW_PANEL.md` and outputs:
+hooker sends the prompt to `ollama run gemma3:4b` with a yes/no classifier. The model responds "yes" — the condition matches. hooker reads `REVIEW_PANEL.md` and outputs:
 
 ```json
 {
@@ -456,7 +456,7 @@ when_prompt "The prompt involves security concerns.", model: "llama3:8b"
 
 **`condition`** — A plain-language description of when the policy should fire.
 
-**`model:`** — The ollama model to use. Default: `gemma3:1b`.
+**`model:`** — The ollama model to use. Default: `gemma3:4b`.
 
 The classifier runs after pattern matching and before execution. If the model responds with "yes" (case-insensitive), the policy fires. Otherwise it is discarded. If ollama is unreachable or the call fails, the classifier returns false — the policy does not fire.
 
@@ -544,7 +544,7 @@ ruby test/test_e2e.rb                        # shimmed only
 HOOKER_E2E_LIVE=1 ruby test/test_e2e.rb      # include live integration tests
 ```
 
-Live tests require `claude` CLI and `ollama` with `gemma3:1b` installed.
+Live tests require `claude` CLI and `ollama` with `gemma3:4b` installed.
 
 ## Principle
 
