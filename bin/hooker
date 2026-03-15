@@ -596,6 +596,11 @@ module Hooker
     exit 0 if raw.nil? || raw.strip.empty?
 
     event = parse_event(raw)
+
+    # Include agent identity if available
+    agent_id = ENV['PROPHET_AGENT_ID']
+    event['agent_id'] = agent_id if agent_id && !agent_id.empty?
+
     cwd = event['cwd'] || Dir.pwd
 
     # Walk up from cwd, collect all policy roots; reverse so broadest scope first
@@ -620,13 +625,13 @@ module Hooker
     event_name = event['hook_event_name']
 
     matched[:gates].each do |p|
-      spill('info', "gate matched: #{p['name']}", policy_name: p['name'], event_type: event_name, decision: 'deny', tool: 'hooker')
+      spill('info', "gate matched: #{p['name']}", policy_name: p['name'], event_type: event_name, decision: 'deny', tool: 'hooker', agent_id: event['agent_id'])
     end
     matched[:transforms].each do |p|
-      spill('info', "transform matched: #{p['name']}", policy_name: p['name'], event_type: event_name, decision: 'transform', tool: 'hooker')
+      spill('info', "transform matched: #{p['name']}", policy_name: p['name'], event_type: event_name, decision: 'transform', tool: 'hooker', agent_id: event['agent_id'])
     end
     matched[:injects].each do |p|
-      spill('info', "inject matched: #{p['name']}", policy_name: p['name'], event_type: event_name, decision: 'inject', tool: 'hooker')
+      spill('info', "inject matched: #{p['name']}", policy_name: p['name'], event_type: event_name, decision: 'inject', tool: 'hooker', agent_id: event['agent_id'])
     end
 
     # Gates: first match denies
